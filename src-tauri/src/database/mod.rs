@@ -18,11 +18,21 @@ pub struct Database {
 impl Database {
     /// Opens or creates the SQLite database at the given path, enabling WAL mode and applying migrations.
     pub fn open(path: &Path) -> SqlResult<Self> {
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-
-        let conn = Connection::open(path)?;
+        let (conn, actual_path) = match (|| -> SqlResult<(Connection, PathBuf)> {
+            if let Some(parent) = path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let c = Connection::open(path)?;
+            Ok((c, path.to_path_buf()))
+        })() {
+            Ok(pair) => pair,
+            Err(e) => {
+                log::warn!("Failed to open DB at {}: {}. Falling back to local chronicle.db", path.display(), e);
+                let fallback = PathBuf::from("chronicle.db");
+                let c = Connection::open(&fallback)?;
+                (c, fallback)
+            }
+        };
 
         // Performance & concurrency pragmas
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -32,7 +42,7 @@ impl Database {
 
         let db = Self {
             conn: Arc::new(Mutex::new(conn)),
-            _db_path: path.to_path_buf(),
+            _db_path: actual_path,
         };
 
         db.migrate()?;

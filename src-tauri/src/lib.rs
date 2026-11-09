@@ -27,10 +27,28 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             // Determine application data directory for SQLite database
-            let app_data_dir = app.path().app_data_dir().unwrap_or_else(|_| {
-                let local = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".to_string());
-                PathBuf::from(local).join("Chronicle")
-            });
+            let app_data_dir = match app.path().app_data_dir() {
+                Ok(p) => {
+                    if std::fs::create_dir_all(&p).is_ok() {
+                        p
+                    } else if let Ok(local) = std::env::var("LOCALAPPDATA") {
+                        let local_dir = PathBuf::from(local).join("Chronicle");
+                        let _ = std::fs::create_dir_all(&local_dir);
+                        local_dir
+                    } else {
+                        PathBuf::from(".")
+                    }
+                }
+                Err(_) => {
+                    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+                        let local_dir = PathBuf::from(local).join("Chronicle");
+                        let _ = std::fs::create_dir_all(&local_dir);
+                        local_dir
+                    } else {
+                        PathBuf::from(".")
+                    }
+                }
+            };
 
             let db_path = app_data_dir.join("chronicle.db");
             log::info!("Chronicle SQLite database path: {}", db_path.display());

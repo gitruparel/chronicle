@@ -12,6 +12,7 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "Chronicle - Universal Date Organizer",
         "width": 1280,
         "height": 850,
@@ -38,8 +39,5 @@
     "resources": [
       "resources/*"
     ]
-  },
-  "plugins": {
-    "dialog": {}
   }
 }
