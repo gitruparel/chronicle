@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use chrono::Utc;
 use crate::copy_engine::hash_file_on_disk;
 use crate::types::{
-    ConfidenceLevel, DateResolution, DateSource, FileStatus, JobOptions, JobRecord, JobStatus,
+    ConfidenceLevel, DateResolution, DateSource, ExcludedItem, FileStatus, JobOptions, JobRecord, JobStatus,
     JobSummary, PlannedFile, ScanErrorItem,
 };
 
@@ -69,6 +69,7 @@ impl Database {
                 copied_files INTEGER DEFAULT 0,
                 copied_bytes INTEGER DEFAULT 0,
                 failed_files INTEGER DEFAULT 0,
+                excluded_files INTEGER DEFAULT 0,
                 options_json TEXT NOT NULL,
                 created_at INTEGER NOT NULL,
                 started_at INTEGER,
@@ -107,12 +108,14 @@ impl Database {
             "#,
         )?;
 
+        // Ensure backward compatibility if database already existed
+        let _ = conn.execute("ALTER TABLE jobs ADD COLUMN excluded_files INTEGER DEFAULT 0", []);
+
         Ok(())
     }
 
-    /// Reconciles database records with filesystem on startup to handle crashes:
-    /// - Resets any running jobs to 'paused'
-    /// - Resets any 'copying' files back to 'pending'
+    /// Reconciles database records on startup to handle unexpected shutdowns:
+    /// Resets any running/scanning/analysing jobs to 'paused'
     fn reconcile_on_startup(&self) -> SqlResult<()> {
         let conn = self.conn.lock().unwrap();
 
@@ -121,19 +124,54 @@ impl Database {
             [],
         )?;
 
-        conn.execute(
-            "UPDATE job_files SET status = 'pending' WHERE status = 'copying'",
-            [],
-        )?;
-
         Ok(())
     }
 
     /// Rigorous disk reconciliation for a specific job:
-    /// Never trusts a 'verified' database record without verifying actual destination on disk.
-    /// Checks existence, byte size, and recomputes SHA-256 hash.
-    /// If disk verification fails, resets status to 'pending' so it can be resumed safely.
+    /// - Cleans up orphaned .chronicle_tmp_* files in destination directories.
+    /// - For 'copying' files, self-heals files completed before the process died, or reverts to pending.
+    /// - Never trusts a 'verified' database record without verifying actual destination on disk.
+    /// - Quarantines corrupted destination files to ensure they never masquerade as valid and frees the planned path.
     pub fn reconcile_job_with_disk(&self, job_id: &str) -> SqlResult<()> {
+        let (dst_root_str,): (String,) = {
+            let conn = self.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT destination_path FROM jobs WHERE id = ?1",
+                params![job_id],
+                |row| Ok((row.get(0)?,)),
+            )?
+        };
+        let dst_root = PathBuf::from(dst_root_str);
+
+        // 1. Clean up any lingering .chronicle_tmp_* files in destination root and date subdirectories
+        if dst_root.exists() {
+            if let Ok(entries) = fs::read_dir(&dst_root) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_file() {
+                        if let Some(fname) = path.file_name().and_then(|n| n.to_str()) {
+                            if fname.starts_with(".chronicle_tmp_") {
+                                log::info!("Recovery: Cleaning orphaned staging file: {}", path.display());
+                                let _ = fs::remove_file(&path);
+                            }
+                        }
+                    } else if path.is_dir() {
+                        if let Ok(sub_entries) = fs::read_dir(&path) {
+                            for sub in sub_entries.flatten() {
+                                let sub_path = sub.path();
+                                if let Some(fname) = sub_path.file_name().and_then(|n| n.to_str()) {
+                                    if fname.starts_with(".chronicle_tmp_") {
+                                        log::info!("Recovery: Cleaning orphaned staging file: {}", sub_path.display());
+                                        let _ = fs::remove_file(&sub_path);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let files = self.get_planned_files(job_id, None, 0)?;
 
         for file in files {
@@ -157,18 +195,60 @@ impl Database {
 
                 if !is_valid {
                     log::warn!(
-                        "Reconciliation: File {} failed destination disk check. Reverting to pending.",
+                        "Reconciliation: File {} failed destination disk check. Quarantining corrupted output and reverting to pending.",
                         file.destination_path.display()
                     );
+                    if file.destination_path.exists() {
+                        let quarantine_name = format!(".chronicle_corrupted_{}_{}", file.id, file.planned_filename);
+                        if let Some(parent) = file.destination_path.parent() {
+                            let quarantine_path = parent.join(quarantine_name);
+                            let _ = fs::rename(&file.destination_path, &quarantine_path);
+                        }
+                    }
                     self.update_file_status(
                         &file.id,
                         FileStatus::Pending,
                         None,
-                        Some("Destination file missing or corrupted after interruption; reverted to pending"),
+                        Some("Destination file missing or corrupted after interruption; quarantined and reverted to pending"),
                     )?;
                 }
             } else if file.status == FileStatus::Copying {
-                self.update_file_status(&file.id, FileStatus::Pending, None, None)?;
+                // Check if file copy completed atomically before process died (Stage 3 self-healing)
+                let mut self_healed = false;
+                if file.destination_path.exists() {
+                    if let Ok(meta) = fs::metadata(&file.destination_path) {
+                        if meta.len() == file.size_bytes {
+                            if let Ok(dst_hash) = hash_file_on_disk(&file.destination_path, 64 * 1024) {
+                                if let Ok(src_hash) = hash_file_on_disk(&file.source_path, 64 * 1024) {
+                                    if dst_hash == src_hash {
+                                        log::info!(
+                                            "Reconciliation self-healing: File {} was completed before crash. Promoting to verified.",
+                                            file.destination_path.display()
+                                        );
+                                        self.update_file_status(
+                                            &file.id,
+                                            FileStatus::Verified,
+                                            Some(&dst_hash),
+                                            None,
+                                        )?;
+                                        self_healed = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !self_healed {
+                        let quarantine_name = format!(".chronicle_corrupted_{}_{}", file.id, file.planned_filename);
+                        if let Some(parent) = file.destination_path.parent() {
+                            let quarantine_path = parent.join(quarantine_name);
+                            let _ = fs::rename(&file.destination_path, &quarantine_path);
+                        }
+                    }
+                }
+
+                if !self_healed {
+                    self.update_file_status(&file.id, FileStatus::Pending, None, None)?;
+                }
             }
         }
 
@@ -179,7 +259,8 @@ impl Database {
             UPDATE jobs
             SET copied_files = (SELECT COUNT(*) FROM job_files WHERE job_id = ?1 AND status = 'verified'),
                 copied_bytes = (SELECT COALESCE(SUM(file_size), 0) FROM job_files WHERE job_id = ?1 AND status = 'verified'),
-                failed_files = (SELECT COUNT(*) FROM job_files WHERE job_id = ?1 AND status = 'failed')
+                failed_files = (SELECT COUNT(*) FROM job_files WHERE job_id = ?1 AND status = 'failed'),
+                excluded_files = (SELECT COUNT(*) FROM job_files WHERE job_id = ?1 AND status = 'excluded')
             WHERE id = ?1
             "#,
             params![job_id],
@@ -219,12 +300,14 @@ impl Database {
         Ok(())
     }
 
-    /// Saves the planned files AND scan errors for a job inside a single transaction
+    /// Saves the planned files, scan errors, AND policy-excluded items for a job inside a single transaction.
+    /// Guarantees that every discovered entry is permanently recorded and accounted for.
     pub fn save_planned_files(
         &self,
         job_id: &str,
         files: &[PlannedFile],
         scan_errors: &[ScanErrorItem],
+        excluded: &[ExcludedItem],
     ) -> SqlResult<()> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
@@ -265,6 +348,7 @@ impl Database {
                     FileStatus::Verified => "verified",
                     FileStatus::Failed => "failed",
                     FileStatus::Skipped => "skipped",
+                    FileStatus::Excluded => "excluded",
                 };
 
                 let date_source_str = match f.date_resolution.date_source {
@@ -346,12 +430,49 @@ impl Database {
                     now,
                 ])?;
             }
+
+            // 3. Insert policy-excluded items (symlinks, junctions, devices) so accounting is 100% complete
+            for exc in excluded {
+                total_files += 1;
+                let exc_id = uuid::Uuid::new_v4().to_string();
+                let fname = exc.path.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "excluded_entry".to_string());
+
+                stmt.execute(params![
+                    exc_id,
+                    job_id,
+                    exc.path.to_string_lossy(),
+                    exc.relative_path.to_string_lossy(),
+                    fname,
+                    Option::<String>::None,
+                    0i64,
+                    Option::<i64>::None,
+                    "excluded",
+                    Option::<String>::None,
+                    "none",
+                    Option::<String>::None,
+                    "fallback",
+                    &exc.reason,
+                    Option::<String>::None,
+                    "Excluded",
+                    fname,
+                    Option::<String>::None,
+                    0,
+                    Option::<u32>::None,
+                    Option::<String>::None,
+                    Some(exc.reason.clone()),
+                    0,
+                    now,
+                ])?;
+            }
         }
 
         let failed_count = scan_errors.len() as i64;
+        let excluded_count = excluded.len() as i64;
         tx.execute(
-            "UPDATE jobs SET total_files = ?1, total_bytes = ?2, failed_files = ?3, status = 'analysed' WHERE id = ?4",
-            params![total_files as i64, total_bytes as i64, failed_count, job_id],
+            "UPDATE jobs SET total_files = ?1, total_bytes = ?2, failed_files = ?3, excluded_files = ?4, status = 'analysed' WHERE id = ?5",
+            params![total_files as i64, total_bytes as i64, failed_count, excluded_count, job_id],
         )?;
 
         tx.commit()?;
@@ -390,6 +511,8 @@ impl Database {
                 "copying" => FileStatus::Copying,
                 "analysed" => FileStatus::Analysed,
                 "skipped" => FileStatus::Skipped,
+                "excluded" => FileStatus::Excluded,
+                "discovered" => FileStatus::Discovered,
                 _ => FileStatus::Pending,
             };
 
@@ -467,6 +590,7 @@ impl Database {
             FileStatus::Verified => "verified",
             FileStatus::Failed => "failed",
             FileStatus::Skipped => "skipped",
+            FileStatus::Excluded => "excluded",
         };
 
         conn.execute(
@@ -545,7 +669,7 @@ impl Database {
             r#"
             SELECT id, name, source_path, destination_path, status,
                    total_files, total_bytes, copied_files, copied_bytes, failed_files,
-                   created_at, completed_at
+                   COALESCE(excluded_files, 0), created_at, completed_at
             FROM jobs
             ORDER BY created_at DESC
             "#,
@@ -577,8 +701,9 @@ impl Database {
                 copied_files: row.get::<_, i64>(7)? as u64,
                 copied_bytes: row.get::<_, i64>(8)? as u64,
                 failed_files: row.get::<_, i64>(9)? as u64,
-                created_at: row.get(10)?,
-                completed_at: row.get(11)?,
+                excluded_files: row.get::<_, i64>(10)? as u64,
+                created_at: row.get(11)?,
+                completed_at: row.get(12)?,
             })
         })?;
 
@@ -618,7 +743,7 @@ impl Database {
         ).unwrap_or(0) as u64;
 
         let no_date_count: u64 = conn.query_row(
-            "SELECT COUNT(*) FROM job_files WHERE job_id = ?1 AND date_source = 'none' AND status != 'failed'",
+            "SELECT COUNT(*) FROM job_files WHERE job_id = ?1 AND date_source = 'none' AND status NOT IN ('failed', 'excluded')",
             params![job_id],
             |r| r.get::<_, i64>(0),
         ).unwrap_or(0) as u64;
@@ -635,8 +760,14 @@ impl Database {
             |r| r.get::<_, i64>(0),
         ).unwrap_or(0) as u64;
 
+        let excluded_count: u64 = conn.query_row(
+            "SELECT COUNT(*) FROM job_files WHERE job_id = ?1 AND status = 'excluded'",
+            params![job_id],
+            |r| r.get::<_, i64>(0),
+        ).unwrap_or(0) as u64;
+
         let unique_folders_count: u64 = conn.query_row(
-            "SELECT COUNT(DISTINCT destination_folder) FROM job_files WHERE job_id = ?1 AND destination_folder != 'Scan Errors'",
+            "SELECT COUNT(DISTINCT destination_folder) FROM job_files WHERE job_id = ?1 AND destination_folder NOT IN ('Scan Errors', 'Excluded')",
             params![job_id],
             |r| r.get::<_, i64>(0),
         ).unwrap_or(0) as u64;
@@ -662,6 +793,7 @@ impl Database {
             duplicate_content_count,
             unique_folders_count,
             scan_error_count,
+            excluded_count,
         })
     }
 }
@@ -711,7 +843,7 @@ mod tests {
             },
         ];
 
-        db.save_planned_files(job_id, &files, &[]).unwrap();
+        db.save_planned_files(job_id, &files, &[], &[]).unwrap();
 
         let retrieved = db.get_planned_files(job_id, None, 0).unwrap();
         assert_eq!(retrieved.len(), 1);

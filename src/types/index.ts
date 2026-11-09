@@ -17,7 +17,8 @@ export type FileStatus =
   | 'copying'
   | 'verified'
   | 'failed'
-  | 'skipped';
+  | 'skipped'
+  | 'excluded';
 
 export type DateSource =
   | 'exif_original'
@@ -75,6 +76,7 @@ export interface JobSummary {
   duplicate_content_count: number;
   unique_folders_count: number;
   scan_error_count: number;
+  excluded_count: number;
 }
 
 export interface JobProgress {
@@ -85,6 +87,7 @@ export interface JobProgress {
   copied_files: number;
   copied_bytes: number;
   failed_files: number;
+  excluded_files: number;
   current_file: string | null;
   current_operation: string;
   speed_bytes_per_sec: number;
@@ -102,6 +105,7 @@ export interface JobRecord {
   copied_files: number;
   copied_bytes: number;
   failed_files: number;
+  excluded_files: number;
   created_at: number;
   completed_at: number | null;
 }

@@ -1,4 +1,4 @@
-use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveDateTime};
+use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveDateTime, TimeZone};
 use serde_json::Value;
 use std::path::Path;
 use crate::types::{ConfidenceLevel, DateResolution, DateSource};
@@ -7,7 +7,7 @@ use crate::types::{ConfidenceLevel, DateResolution, DateSource};
 /// Handles:
 /// - EXIF local wall-clock: "YYYY:MM:DD HH:MM:SS" (preserved directly without UTC distortion)
 /// - Explicit timezone offset: "YYYY:MM:DD HH:MM:SS+HH:MM" or ISO 8601
-/// - UTC timestamps with Z: converted to local calendar day
+/// - UTC timestamps with Z or +00:00: converted to local calendar day
 pub fn parse_timestamp_to_date(raw: &str) -> Option<(String, Option<String>)> {
     let trimmed = raw.trim();
     if trimmed.is_empty() || trimmed.starts_with("0000:00:00") || trimmed.starts_with("0000-00-00") {
@@ -41,7 +41,15 @@ pub fn parse_timestamp_to_date(raw: &str) -> Option<(String, Option<String>)> {
     if let Ok(dt) = DateTime::parse_from_rfc3339(trimmed) {
         let year = dt.year();
         if (1970..=2100).contains(&year) {
-            return Some((dt.format("%Y-%m-%d").to_string(), Some(dt.offset().to_string())));
+            let offset_secs = dt.offset().local_minus_utc();
+            if offset_secs == 0 {
+                // UTC moment (+00:00) -> convert to local calendar day
+                let local_dt = dt.with_timezone(&Local);
+                return Some((local_dt.format("%Y-%m-%d").to_string(), Some("UTC converted to Local".to_string())));
+            } else {
+                // Non-zero offset (e.g. +02:00, -08:00) -> preserve local capture scene date
+                return Some((dt.format("%Y-%m-%d").to_string(), Some(dt.offset().to_string())));
+            }
         }
     }
 
@@ -76,6 +84,28 @@ pub fn parse_timestamp_to_date(raw: &str) -> Option<(String, Option<String>)> {
         }
     }
 
+    None
+}
+
+/// Parses a QuickTime creation timestamp which is stored in UTC without timezone in container atoms.
+/// Converts the UTC time to user's Local calendar day.
+pub fn parse_quicktime_utc_timestamp(raw: &str) -> Option<(String, Option<String>)> {
+    let trimmed = raw.trim();
+    let formats = [
+        "%Y:%m:%d %H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y/%m/%d %H:%M:%S",
+    ];
+    for fmt in &formats {
+        if let Ok(ndt) = NaiveDateTime::parse_from_str(trimmed, fmt) {
+            let utc_dt = chrono::Utc.from_utc_datetime(&ndt);
+            let local_dt = utc_dt.with_timezone(&Local);
+            let year = local_dt.year();
+            if (1970..=2100).contains(&year) {
+                return Some((local_dt.format("%Y-%m-%d").to_string(), Some("QuickTime UTC converted to Local".to_string())));
+            }
+        }
+    }
     None
 }
 
@@ -150,7 +180,15 @@ pub fn resolve_date(
         ];
 
         if let Some((tag, val)) = find_tag_value(meta, &primary_capture_tags) {
-            if let Some((date_str, tz)) = parse_timestamp_to_date(val) {
+            let is_utc_container_tag = tag == "QuickTime:CreateDate" || tag == "QuickTime:TrackCreateDate" || tag == "Matroska:DateUTC";
+            let parsed_opt = if is_utc_container_tag && !val.contains('+') && !val.contains('-') && !val.ends_with('Z') && !val.ends_with('z') {
+                // Container stores naive timestamps in UTC by spec -> convert to Local
+                parse_quicktime_utc_timestamp(val).or_else(|| parse_timestamp_to_date(val))
+            } else {
+                parse_timestamp_to_date(val)
+            };
+
+            if let Some((date_str, tz)) = parsed_opt {
                 let date_source = if tag.contains("QuickTime") || tag.contains("Matroska") {
                     DateSource::QuickTimeCreation
                 } else if tag.contains("EXIF") || tag.contains("DateTimeOriginal") {
@@ -242,8 +280,23 @@ mod tests {
         assert_eq!(d2, "2023-11-04");
         assert_eq!(tz2, Some("+02:00".to_string()));
 
+        // UTC ISO timestamp with +00:00
+        let (d3, tz3) = parse_timestamp_to_date("2024-05-18T14:30:00+00:00").unwrap();
+        assert!(tz3.unwrap().contains("UTC"));
+        assert!(!d3.is_empty());
+
         assert!(parse_timestamp_to_date("0000:00:00 00:00:00").is_none());
         assert!(parse_timestamp_to_date("1905:01:01 00:00:00").is_none());
+    }
+
+    #[test]
+    fn test_quicktime_utc_timestamp_handling() {
+        // QuickTime CreateDate is defined in UTC
+        let qt_res = parse_quicktime_utc_timestamp("2024:05:18 18:30:00");
+        assert!(qt_res.is_some());
+        let (d, tz) = qt_res.unwrap();
+        assert!(!d.is_empty());
+        assert_eq!(tz, Some("QuickTime UTC converted to Local".to_string()));
     }
 
     #[test]

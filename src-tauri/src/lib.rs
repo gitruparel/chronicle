@@ -39,7 +39,7 @@ pub fn run() {
                 .expect("Failed to initialize SQLite database for Chronicle");
 
             let job_manager = JobManager::new(db);
-            let exiftool = ExifToolManager::new();
+            let exiftool = ExifToolManager::from_app_handle(app.handle());
 
             if exiftool.is_available() {
                 log::info!("ExifTool available at: {:?}", exiftool.get_path());

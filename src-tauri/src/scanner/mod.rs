@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 use walkdir::WalkDir;
 use uuid::Uuid;
-use crate::types::{OverlapCheckResult, ScanErrorItem, ScanResult, ScannedFile};
+use crate::types::{ExcludedItem, OverlapCheckResult, ScanErrorItem, ScanResult, ScannedFile};
 
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt;
@@ -87,6 +87,7 @@ pub fn scan_directory(source_root: &Path, recursive: bool) -> Result<ScanResult,
     let max_depth = if recursive { usize::MAX } else { 1 };
     let mut files = Vec::new();
     let mut errors = Vec::new();
+    let mut excluded = Vec::new();
 
     let walker = WalkDir::new(&canonical_root)
         .max_depth(max_depth)
@@ -109,29 +110,45 @@ pub fn scan_directory(source_root: &Path, recursive: bool) -> Result<ScanResult,
             }
         };
 
-        // If directory is a symlink or junction, do not traverse into it to prevent recursion loops
-        if entry.file_type().is_dir() {
-            if entry.path() != canonical_root && is_reparse_point_or_symlink(&entry) {
-                log::info!("Skipping directory junction/symlink loop: {}", entry.path().display());
-            }
-            continue;
-        }
-
-        // Only process regular files
-        if !entry.file_type().is_file() {
-            continue;
-        }
-
-        // Avoid following file-level symlinks
-        if is_reparse_point_or_symlink(&entry) {
-            log::info!("Skipping reparse point/symlink file: {}", entry.path().display());
-            continue;
-        }
-
         let path = entry.path().to_path_buf();
         let relative_path = path.strip_prefix(&canonical_root)
             .unwrap_or(&path)
             .to_path_buf();
+
+        // 1. Directory symlink / junction loop exclusion
+        if entry.file_type().is_dir() {
+            if entry.path() != canonical_root && is_reparse_point_or_symlink(&entry) {
+                log::info!("Excluding directory junction/symlink: {}", path.display());
+                excluded.push(ExcludedItem {
+                    path,
+                    relative_path,
+                    reason: "Directory junction / symlink excluded by policy to prevent recursion loops".to_string(),
+                });
+            }
+            continue;
+        }
+
+        // 2. File-level symlink or reparse point exclusion
+        if is_reparse_point_or_symlink(&entry) {
+            log::info!("Excluding reparse point/symlink file: {}", path.display());
+            excluded.push(ExcludedItem {
+                path,
+                relative_path,
+                reason: "File-level symlink / reparse point excluded by policy".to_string(),
+            });
+            continue;
+        }
+
+        // 3. Non-regular filesystem entry exclusion (e.g. pipes, sockets, devices)
+        if !entry.file_type().is_file() {
+            log::info!("Excluding non-regular special entry: {}", path.display());
+            excluded.push(ExcludedItem {
+                path,
+                relative_path,
+                reason: "Non-regular entry / special device excluded by policy".to_string(),
+            });
+            continue;
+        }
 
         let metadata = match fs::metadata(&path) {
             Ok(m) => m,
@@ -181,7 +198,7 @@ pub fn scan_directory(source_root: &Path, recursive: bool) -> Result<ScanResult,
         });
     }
 
-    Ok(ScanResult { files, errors })
+    Ok(ScanResult { files, errors, excluded })
 }
 
 #[cfg(test)]
@@ -232,6 +249,7 @@ mod tests {
         let res = scan_directory(root, true).unwrap();
         assert_eq!(res.files.len(), 5);
         assert_eq!(res.errors.len(), 0);
+        assert_eq!(res.excluded.len(), 0);
 
         let zero_byte = res.files.iter().find(|f| f.filename == "empty.bin").unwrap();
         assert_eq!(zero_byte.size_bytes, 0);

@@ -14,6 +14,7 @@ import {
   Copy,
   AlertCircle,
   Tag,
+  ShieldAlert,
 } from 'lucide-react';
 import { api } from '../lib/api';
 import type { JobSummary, PlannedFile } from '../types';
@@ -76,6 +77,12 @@ export function PreviewPage({ jobId, summary, onBack, onConfirmCopy }: PreviewPa
       }
       if (sourceFilter === 'collisions') {
         return f.is_collision;
+      }
+      if (sourceFilter === 'excluded') {
+        return f.status === 'excluded';
+      }
+      if (sourceFilter === 'errors') {
+        return f.status === 'failed' || f.destination_folder === 'Scan Errors';
       }
       return true;
     });
@@ -177,6 +184,19 @@ export function PreviewPage({ jobId, summary, onBack, onConfirmCopy }: PreviewPa
         </div>
       </div>
 
+      {/* Accountability Banner if non-regular files or errors exist */}
+      {(summary.scan_error_count > 0 || summary.excluded_count > 0) && (
+        <div className="flex items-center gap-3 p-3 rounded-xl bg-amber-500/10 border border-amber-500/20 text-amber-300 text-xs">
+          <ShieldAlert className="h-4 w-4 shrink-0 text-amber-400" />
+          <div className="flex-1 flex flex-wrap items-center gap-x-4 gap-y-1">
+            <span><strong>Zero-Drop Accountability:</strong> {summary.total_files.toLocaleString()} total items discovered.</span>
+            {summary.scan_error_count > 0 && <span>&bull; {summary.scan_error_count} unreadable traversal errors</span>}
+            {summary.excluded_count > 0 && <span>&bull; {summary.excluded_count} policy-excluded (symlinks/devices)</span>}
+            <span>&bull; {summary.total_files - summary.scan_error_count - summary.excluded_count} regular files planned for copy.</span>
+          </div>
+        </div>
+      )}
+
       {/* Search and Filters Bar */}
       <div className="flex flex-col sm:flex-row items-center justify-between gap-3 bg-surface p-2.5 rounded-xl border border-border">
         <div className="relative w-full sm:w-80">
@@ -200,6 +220,8 @@ export function PreviewPage({ jobId, summary, onBack, onConfirmCopy }: PreviewPa
             { id: 'modified', label: 'Modified Date' },
             { id: 'no_date', label: 'No Date' },
             { id: 'collisions', label: 'Collisions' },
+            ...(summary.excluded_count > 0 ? [{ id: 'excluded', label: `Excluded (${summary.excluded_count})` }] : []),
+            ...(summary.scan_error_count > 0 ? [{ id: 'errors', label: `Errors (${summary.scan_error_count})` }] : []),
           ].map((item) => (
             <button
               key={item.id}

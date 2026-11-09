@@ -40,6 +40,7 @@ export function ExecutionPage({
     copied_files: 0,
     copied_bytes: 0,
     failed_files: 0,
+    excluded_files: 0,
     current_file: null,
     current_operation: 'Initializing copy engine...',
     speed_bytes_per_sec: 0,

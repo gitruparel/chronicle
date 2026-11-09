@@ -184,12 +184,12 @@ export function CompletionPage({
 
         <div className="rounded-xl border border-border bg-surface p-3 space-y-1 text-xs">
           <span className="text-text-muted flex items-center gap-1.5">
-            <AlertTriangle className="h-3.5 w-3.5 text-amber-400" /> Failures / Errors
+            <AlertTriangle className="h-3.5 w-3.5 text-amber-400" /> Errors & Excluded
           </span>
           <div className="font-semibold text-text-primary">
-            {(summary.scan_error_count + summary.metadata_error_count).toLocaleString()} issues
+            {summary.scan_error_count} errors &bull; {summary.excluded_count || 0} excluded
           </div>
-          <p className="text-[10px] text-text-muted">All tracked in database and reports</p>
+          <p className="text-[10px] text-text-muted">Accounted for in database and reports</p>
         </div>
       </div>
 

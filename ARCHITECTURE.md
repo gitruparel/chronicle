@@ -95,7 +95,7 @@ Resolves a deterministic calendar date (`YYYY-MM-DD`) and timestamp for each fil
   3. Mid-stream cooperative pause (`pause_flag`) and cancellation checks.
   4. Physical disk flush via `dst_file.sync_all()` to guarantee physical storage persistence before validation.
   5. **Independent Destination Hash Verification**: Re-opens temporary destination file from disk, computes SHA-256 independently, and verifies `src_hash == dst_hash`.
-  6. Non-overwriting atomic commit via `commit_non_overwriting` to guarantee existing files are never overwritten even during race conditions.
+  6. **Kernel-Level Atomic No-Overwrite Commit**: Commits via `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING` (returning `ERROR_ALREADY_EXISTS` on collision), guaranteeing absolute race immunity against concurrent creation.
 - **Cancellation & Cleanup**:
   - Incomplete `.chronicle_tmp_*` files are deleted immediately if copy fails or user cancels.
 - **Source Verification**:
@@ -105,11 +105,12 @@ Resolves a deterministic calendar date (`YYYY-MM-DD`) and timestamp for each fil
 - SQLite database stored at `%APPDATA%/Chronicle/chronicle.db` (or application data directory).
 - Uses WAL (Write-Ahead Logging) mode and busy timeout for concurrent safety.
 - **Schema**:
-  - `jobs`: Job ID, source path, destination path, options JSON, status (`discovered`, `analysed`, `running`, `paused`, `completed`, `cancelled`, `failed`), timestamps, metrics, error count.
-  - `job_files`: File ID, job ID, source path, relative path, file size, source mtime, status (`discovered`, `analysed`, `pending`, `copying`, `verified`, `failed`, `cancelled`), resolved date, date source, planned filename, destination path, sha256, error message, attempt count.
-- **Crash Recovery & Reconciliation**:
-  - On restart and after execution, `reconcile_job_with_disk` physically checks destination existence, size, and SHA-256 hash.
-  - Uncompleted files in `copying` state are reset to `pending` after removing lingering `.chronicle_tmp_*` files.
+  - `jobs`: Job ID, source path, destination path, options JSON, status (`discovered`, `analysed`, `running`, `paused`, `completed`, `cancelled`, `failed`), timestamps, metrics, error count, excluded count.
+  - `job_files`: File ID, job ID, source path, relative path, file size, source mtime, status (`discovered`, `analysed`, `pending`, `copying`, `verified`, `failed`, `cancelled`, `excluded`), resolved date, date source, planned filename, destination path, sha256, error message, attempt count.
+- **Multi-Stage Crash Recovery & Self-Healing**:
+  - Cleans up orphaned `.chronicle_tmp_*` staging files across all destination directories.
+  - Files completed before process interruption self-heal from `copying` to `verified` after validating physical size and SHA-256.
+  - Corrupted destination files on disk are safely moved to `.chronicle_corrupted_*` and their database records reset to `pending` so retry can place a clean copy at the planned path.
   - Fully persistent history across application restarts via `get_all_jobs`.
 
 ---

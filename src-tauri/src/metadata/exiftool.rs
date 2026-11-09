@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use serde_json::Value;
+use tauri::{AppHandle, Manager};
 
 pub struct ExifToolManager {
     executable_path: Option<PathBuf>,
@@ -8,7 +9,13 @@ pub struct ExifToolManager {
 
 impl ExifToolManager {
     pub fn new() -> Self {
-        let path = Self::locate_exiftool();
+        let path = Self::locate_exiftool_with_app(None);
+        Self { executable_path: path }
+    }
+
+    /// Primary production constructor using Tauri 2 runtime resource resolver
+    pub fn from_app_handle(app: &AppHandle) -> Self {
+        let path = Self::locate_exiftool_with_app(Some(app));
         Self { executable_path: path }
     }
 
@@ -26,23 +33,37 @@ impl ExifToolManager {
         self.executable_path.as_ref()
     }
 
-    /// Finds exiftool in known locations:
-    /// 1. Application resource directory
-    /// 2. Next to executable
-    /// 3. Known install path in user LocalAppData
-    /// 4. System PATH
     pub fn locate_exiftool() -> Option<PathBuf> {
-        // 1. Current working directory / workspace resources
-        let candidate1 = PathBuf::from("src-tauri/resources/exiftool.exe");
-        if candidate1.exists() {
-            return Some(candidate1);
-        }
-        let candidate1_alt = PathBuf::from("resources/exiftool.exe");
-        if candidate1_alt.exists() {
-            return Some(candidate1_alt);
+        Self::locate_exiftool_with_app(None)
+    }
+
+    /// Finds exiftool in known locations:
+    /// 1. Official Tauri 2 runtime resource directory (for packaged production installer/NSIS)
+    /// 2. Next to executable or sibling resources directory
+    /// 3. Development workspace resources folder (src-tauri/resources/exiftool.exe)
+    /// 4. Known install path in user LocalAppData
+    /// 5. System PATH
+    pub fn locate_exiftool_with_app(app: Option<&AppHandle>) -> Option<PathBuf> {
+        // 1. Official Tauri 2 resource resolver
+        if let Some(app_handle) = app {
+            if let Ok(resolved) = app_handle.path().resolve("resources/exiftool.exe", tauri::path::BaseDirectory::Resource) {
+                if resolved.exists() {
+                    return Some(resolved);
+                }
+            }
+            if let Ok(res_dir) = app_handle.path().resource_dir() {
+                let candidate_sub = res_dir.join("resources").join("exiftool.exe");
+                if candidate_sub.exists() {
+                    return Some(candidate_sub);
+                }
+                let candidate_flat = res_dir.join("exiftool.exe");
+                if candidate_flat.exists() {
+                    return Some(candidate_flat);
+                }
+            }
         }
 
-        // 2. Next to current executable
+        // 2. Next to current executable (packaged binary sibling)
         if let Ok(current_exe) = std::env::current_exe() {
             if let Some(parent) = current_exe.parent() {
                 let candidate2 = parent.join("resources").join("exiftool.exe");
@@ -56,7 +77,17 @@ impl ExifToolManager {
             }
         }
 
-        // 3. User LocalAppData Programs
+        // 3. Current working directory / workspace resources (dev mode)
+        let candidate1 = PathBuf::from("src-tauri/resources/exiftool.exe");
+        if candidate1.exists() {
+            return Some(candidate1);
+        }
+        let candidate1_alt = PathBuf::from("resources/exiftool.exe");
+        if candidate1_alt.exists() {
+            return Some(candidate1_alt);
+        }
+
+        // 4. User LocalAppData Programs
         if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
             let candidate3 = PathBuf::from(local_app_data).join("Programs").join("ExifTool").join("ExifTool.exe");
             if candidate3.exists() {
@@ -64,7 +95,7 @@ impl ExifToolManager {
             }
         }
 
-        // 4. PATH lookup
+        // 5. System PATH lookup
         if let Ok(output) = Command::new("exiftool").arg("-ver").output() {
             if output.status.success() {
                 return Some(PathBuf::from("exiftool"));

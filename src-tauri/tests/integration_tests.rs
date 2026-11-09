@@ -1,6 +1,6 @@
 use std::fs::{self, File};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tempfile::tempdir;
 use sha2::{Digest, Sha256};
 use serde_json::json;
@@ -104,7 +104,7 @@ fn test_end_to_end_pipeline_with_diverse_fixtures() {
     let db = Database::open(&db_path).unwrap();
     let job_id = "test-job-e2e";
     db.create_job(job_id, "E2E Test Job", src, dst, &JobOptions::default()).unwrap();
-    db.save_planned_files(job_id, &planned, &scan_res.errors).unwrap();
+    db.save_planned_files(job_id, &planned, &scan_res.errors, &scan_res.excluded).unwrap();
 
     // 7. Execute copies through the copy engine
     let copy_opts = CopyOptions::default();
@@ -172,7 +172,12 @@ fn test_timezone_interpretation_and_wall_clock_rules() {
     assert_eq!(d4, "2024-05-18");
     assert_eq!(tz4, Some("UTC converted to Local".to_string()));
 
-    // 5. Invalid corrupt dates: 0000:00:00 or garbage
+    // 5. Explicit UTC offset (+00:00)
+    let (d5, tz5) = parse_timestamp_to_date("2024-05-18T18:00:00+00:00").unwrap();
+    assert_eq!(d5, "2024-05-18");
+    assert_eq!(tz5, Some("UTC converted to Local".to_string()));
+
+    // 6. Invalid corrupt dates: 0000:00:00 or garbage
     assert!(parse_timestamp_to_date("0000:00:00 00:00:00").is_none());
     assert!(parse_timestamp_to_date("not a date string").is_none());
     assert!(parse_timestamp_to_date("").is_none());
@@ -207,34 +212,67 @@ fn test_source_destination_overlap_protection() {
 #[test]
 fn test_crash_recovery_and_reconciliation() {
     let dir = tempdir().unwrap();
+    let src_dir = dir.path().join("source");
+    let dst_dir = dir.path().join("destination");
+    fs::create_dir_all(&src_dir).unwrap();
+    fs::create_dir_all(&dst_dir).unwrap();
     let db_path = dir.path().join("recovery_test.db");
 
-    // Phase A: Create DB and simulate uncompleted/interrupted job
+    // Create source files
+    let src_1 = src_dir.join("stage1.txt");
+    fs::write(&src_1, b"Stage 1 test content").unwrap();
+    let src_2 = src_dir.join("stage2.txt");
+    fs::write(&src_2, b"Stage 2 partial crash content").unwrap();
+    let src_3 = src_dir.join("stage3.txt");
+    fs::write(&src_3, b"Stage 3 completed before DB update content").unwrap();
+    let src_4 = src_dir.join("stage4.txt");
+    fs::write(&src_4, b"Stage 4 valid source content").unwrap();
+
+    let job_id = "job-crashed-multi-stage";
+
+    // Destination target folder
+    let dst_sub = dst_dir.join("2024-05-18");
+    fs::create_dir_all(&dst_sub).unwrap();
+
+    // Stage 1: Orphaned .chronicle_tmp_* staging file
+    let orphan_tmp = dst_sub.join(".chronicle_tmp_orphan_1234.tmp");
+    fs::write(&orphan_tmp, b"incomplete staging bytes").unwrap();
+    assert!(orphan_tmp.exists());
+
+    // Stage 3 simulation: destination file is already written and has valid source bytes on disk,
+    // but the process crashed before SQLite was updated (status in DB is 'copying').
+    let dst_3 = dst_sub.join("stage3.txt");
+    fs::write(&dst_3, b"Stage 3 completed before DB update content").unwrap();
+
+    // Stage 4 simulation: destination file was written, but subsequently got corrupted on disk!
+    let dst_4 = dst_sub.join("stage4.txt");
+    fs::write(&dst_4, b"corrupted bytes on disk").unwrap();
+
+    // Phase A: Create DB and record job with files at various stages
     {
         let db = Database::open(&db_path).unwrap();
-        let job_id = "job-crashed";
-        db.create_job(job_id, "Crashed Job", Path::new("C:/Source"), Path::new("C:/Dest"), &JobOptions::default()).unwrap();
+        db.create_job(job_id, "Multi-stage Recovery Job", &src_dir, &dst_dir, &JobOptions::default()).unwrap();
 
         let files = vec![
             PlannedFile {
-                id: "file-pending".to_string(),
-                source_path: PathBuf::from("C:/Source/1.jpg"),
-                relative_path: PathBuf::from("1.jpg"),
-                filename: "1.jpg".to_string(),
-                extension: Some("jpg".to_string()),
-                size_bytes: 100,
+                id: "file-stage1".to_string(),
+                source_path: src_1.clone(),
+                relative_path: PathBuf::from("stage1.txt"),
+                filename: "stage1.txt".to_string(),
+                extension: Some("txt".to_string()),
+                size_bytes: 20,
                 modified_ms: None,
                 date_resolution: DateResolution {
                     resolved_date: Some("2024-05-18".to_string()),
-                    date_source: DateSource::ExifOriginal,
+                    date_source: DateSource::FilesystemModified,
                     raw_timestamp: None,
                     confidence: ConfidenceLevel::High,
-                    reason: "EXIF".to_string(),
+                    reason: "Mtime".to_string(),
                     timezone_info: None,
                 },
                 destination_folder: "2024-05-18".to_string(),
-                planned_filename: "1.jpg".to_string(),
-                destination_path: PathBuf::from("C:/Dest/2024-05-18/1.jpg"),
+                planned_filename: "stage1.txt".to_string(),
+                destination_path: dst_sub.join("stage1.txt"),
                 is_collision: false,
                 collision_suffix: None,
                 status: FileStatus::Pending,
@@ -242,45 +280,113 @@ fn test_crash_recovery_and_reconciliation() {
                 error_message: None,
             },
             PlannedFile {
-                id: "file-was-copying".to_string(),
-                source_path: PathBuf::from("C:/Source/2.jpg"),
-                relative_path: PathBuf::from("2.jpg"),
-                filename: "2.jpg".to_string(),
-                extension: Some("jpg".to_string()),
-                size_bytes: 200,
+                id: "file-stage2".to_string(),
+                source_path: src_2.clone(),
+                relative_path: PathBuf::from("stage2.txt"),
+                filename: "stage2.txt".to_string(),
+                extension: Some("txt".to_string()),
+                size_bytes: 30,
                 modified_ms: None,
                 date_resolution: DateResolution {
                     resolved_date: Some("2024-05-18".to_string()),
-                    date_source: DateSource::ExifOriginal,
+                    date_source: DateSource::FilesystemModified,
                     raw_timestamp: None,
                     confidence: ConfidenceLevel::High,
-                    reason: "EXIF".to_string(),
+                    reason: "Mtime".to_string(),
                     timezone_info: None,
                 },
                 destination_folder: "2024-05-18".to_string(),
-                planned_filename: "2.jpg".to_string(),
-                destination_path: PathBuf::from("C:/Dest/2024-05-18/2.jpg"),
+                planned_filename: "stage2.txt".to_string(),
+                destination_path: dst_sub.join("stage2.txt"),
                 is_collision: false,
                 collision_suffix: None,
-                status: FileStatus::Copying, // was mid-stream when process crashed
+                status: FileStatus::Copying, // was copying when crashed, no destination file committed
                 sha256: None,
+                error_message: None,
+            },
+            PlannedFile {
+                id: "file-stage3".to_string(),
+                source_path: src_3.clone(),
+                relative_path: PathBuf::from("stage3.txt"),
+                filename: "stage3.txt".to_string(),
+                extension: Some("txt".to_string()),
+                size_bytes: fs::metadata(&src_3).unwrap().len(),
+                modified_ms: None,
+                date_resolution: DateResolution {
+                    resolved_date: Some("2024-05-18".to_string()),
+                    date_source: DateSource::FilesystemModified,
+                    raw_timestamp: None,
+                    confidence: ConfidenceLevel::High,
+                    reason: "Mtime".to_string(),
+                    timezone_info: None,
+                },
+                destination_folder: "2024-05-18".to_string(),
+                planned_filename: "stage3.txt".to_string(),
+                destination_path: dst_3.clone(),
+                is_collision: false,
+                collision_suffix: None,
+                status: FileStatus::Copying, // was marked copying, but destination file was already renamed!
+                sha256: None,
+                error_message: None,
+            },
+            PlannedFile {
+                id: "file-stage4".to_string(),
+                source_path: src_4.clone(),
+                relative_path: PathBuf::from("stage4.txt"),
+                filename: "stage4.txt".to_string(),
+                extension: Some("txt".to_string()),
+                size_bytes: fs::metadata(&src_4).unwrap().len(),
+                modified_ms: None,
+                date_resolution: DateResolution {
+                    resolved_date: Some("2024-05-18".to_string()),
+                    date_source: DateSource::FilesystemModified,
+                    raw_timestamp: None,
+                    confidence: ConfidenceLevel::High,
+                    reason: "Mtime".to_string(),
+                    timezone_info: None,
+                },
+                destination_folder: "2024-05-18".to_string(),
+                planned_filename: "stage4.txt".to_string(),
+                destination_path: dst_4.clone(),
+                is_collision: false,
+                collision_suffix: None,
+                status: FileStatus::Verified, // was marked verified, but disk bytes are corrupted!
+                sha256: Some(compute_sha256(b"Stage 4 valid source content")),
                 error_message: None,
             },
         ];
 
-        db.save_planned_files(job_id, &files, &[]).unwrap();
-        // Mark job as running
+        db.save_planned_files(job_id, &files, &[], &[]).unwrap();
         db.update_job_status(job_id, chronicle_lib::types::JobStatus::Running).unwrap();
-    } // db is dropped here (simulating crash)
+    } // Simulated crash: DB dropped
 
-    // Phase B: Application restarts -> open database runs reconcile_on_startup()
+    // Phase B: Application restarts -> open database runs startup reconciliation
     let recovered_db = Database::open(&db_path).unwrap();
 
-    let files = recovered_db.get_planned_files("job-crashed", None, 0).unwrap();
-    let was_copying_file = files.iter().find(|f| f.id == "file-was-copying").unwrap();
+    // Trigger explicit disk reconciliation on the recovered job
+    recovered_db.reconcile_job_with_disk(job_id).unwrap();
 
-    // Reconciled to pending so user can safely resume!
-    assert_eq!(was_copying_file.status, FileStatus::Pending);
+    // 1. Verify Stage 1: Orphaned .chronicle_tmp_* was deleted
+    assert!(!orphan_tmp.exists(), "Orphaned .chronicle_tmp_* must be cleaned up on recovery");
+
+    let recovered_files = recovered_db.get_planned_files(job_id, None, 0).unwrap();
+
+    // 2. Verify Stage 2: Incomplete copy reset to pending
+    let f2 = recovered_files.iter().find(|f| f.id == "file-stage2").unwrap();
+    assert_eq!(f2.status, FileStatus::Pending);
+
+    // 3. Verify Stage 3: Completed copy before DB update is self-healed to Verified!
+    let f3 = recovered_files.iter().find(|f| f.id == "file-stage3").unwrap();
+    assert_eq!(f3.status, FileStatus::Verified, "Self-healing must promote valid destination to verified");
+    assert!(f3.sha256.is_some());
+
+    // 4. Verify Stage 4: Corrupted destination was quarantined and reverted to Pending
+    let f4 = recovered_files.iter().find(|f| f.id == "file-stage4").unwrap();
+    assert_eq!(f4.status, FileStatus::Pending, "Corrupted verified file must be reverted to pending");
+    assert!(!dst_4.exists(), "Original corrupted destination file must be moved to quarantine");
+    let quarantine_path = dst_sub.join(format!(".chronicle_corrupted_{}_{}", f4.id, f4.planned_filename));
+    assert!(quarantine_path.exists(), "Quarantine file must exist on disk");
+    assert_eq!(fs::read(&quarantine_path).unwrap(), b"corrupted bytes on disk");
 }
 
 #[test]

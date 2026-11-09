@@ -57,8 +57,83 @@ pub fn hash_file_on_disk(path: &Path, buffer_size: usize) -> Result<String, std:
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+#[cfg(windows)]
+mod platform {
+    use std::io;
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x00000008;
+    const ERROR_ALREADY_EXISTS: i32 = 183;
+    const ERROR_FILE_EXISTS: i32 = 80;
+
+    extern "system" {
+        fn MoveFileExW(
+            lpExistingFileName: *const u16,
+            lpNewFileName: *const u16,
+            dwFlags: u32,
+        ) -> i32;
+    }
+
+    fn to_wide(p: &Path) -> Vec<u16> {
+        p.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    /// Atomically renames `from` to `to` with a zero overwrite guarantee.
+    /// Returns:
+    /// - Ok(true) if rename succeeded.
+    /// - Ok(false) if target already exists (atomic rejection by OS kernel).
+    /// - Err(e) if another I/O error occurred.
+    pub fn atomic_move_no_replace(from: &Path, to: &Path) -> Result<bool, io::Error> {
+        let from_w = to_wide(from);
+        let to_w = to_wide(to);
+
+        // Crucial: we do NOT specify MOVEFILE_REPLACE_EXISTING (0x00000001).
+        // On Windows, calling MoveFileExW without MOVEFILE_REPLACE_EXISTING fails
+        // atomically if lpNewFileName exists.
+        let ret = unsafe {
+            MoveFileExW(
+                from_w.as_ptr(),
+                to_w.as_ptr(),
+                MOVEFILE_WRITE_THROUGH,
+            )
+        };
+
+        if ret != 0 {
+            Ok(true)
+        } else {
+            let err = io::Error::last_os_error();
+            if let Some(code) = err.raw_os_error() {
+                if code == ERROR_ALREADY_EXISTS || code == ERROR_FILE_EXISTS {
+                    return Ok(false);
+                }
+            }
+            Err(err)
+        }
+    }
+}
+
+#[cfg(not(windows))]
+mod platform {
+    use std::fs;
+    use std::io;
+    use std::path::Path;
+
+    pub fn atomic_move_no_replace(from: &Path, to: &Path) -> Result<bool, io::Error> {
+        match fs::hard_link(from, to) {
+            Ok(()) => {
+                let _ = fs::remove_file(from);
+                Ok(true)
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+}
+
 /// Atomically commits a temporary file to a target destination without ever overwriting.
-/// If target already exists on disk, allocates a collision suffix deterministically.
+/// Employs atomic kernel no-replace operations (MoveFileExW without MOVEFILE_REPLACE_EXISTING)
+/// to eliminate any time-of-check to time-of-use (TOCTOU) race conditions.
 pub fn commit_non_overwriting(tmp_path: &Path, planned_dest: &Path) -> Result<PathBuf, String> {
     let parent_dir = planned_dest.parent()
         .ok_or_else(|| "Destination has no parent directory".to_string())?;
@@ -72,18 +147,28 @@ pub fn commit_non_overwriting(tmp_path: &Path, planned_dest: &Path) -> Result<Pa
     let mut candidate_path = planned_dest.to_path_buf();
     let mut suffix = 0;
 
-    // Loop until we find a target that does not exist, ensuring zero overwrite
-    while candidate_path.exists() {
-        suffix += 1;
-        let suffixed_name = make_suffixed_filename(&stem, ext.as_deref(), suffix);
-        candidate_path = parent_dir.join(&suffixed_name);
+    loop {
+        match platform::atomic_move_no_replace(tmp_path, &candidate_path) {
+            Ok(true) => {
+                // Successfully moved atomically with zero overwrite guarantee
+                return Ok(candidate_path);
+            }
+            Ok(false) => {
+                // Destination already exists at kernel level! Allocate collision suffix and retry.
+                suffix += 1;
+                let suffixed_name = make_suffixed_filename(&stem, ext.as_deref(), suffix);
+                candidate_path = parent_dir.join(&suffixed_name);
+            }
+            Err(e) => {
+                return Err(format!(
+                    "Failed to atomically commit file from {} to {}: {}",
+                    tmp_path.display(),
+                    candidate_path.display(),
+                    e
+                ));
+            }
+        }
     }
-
-    // Atomic rename to confirmed non-existing path
-    fs::rename(tmp_path, &candidate_path)
-        .map_err(|e| format!("Failed to commit file from {} to {}: {}", tmp_path.display(), candidate_path.display(), e))?;
-
-    Ok(candidate_path)
 }
 
 /// Copies a single file using:
@@ -456,5 +541,58 @@ mod tests {
         let res = handle.join().unwrap();
         assert!(res.success);
         assert_eq!(res.bytes_copied, 50_000);
+    }
+
+    #[test]
+    fn test_concurrent_atomic_commit_race_safety() {
+        let dst_dir = tempdir().unwrap();
+        let target_dest = dst_dir.path().join("racing_file.txt");
+
+        // Spawn 10 concurrent threads all trying to commit to the exact same target path simultaneously
+        let num_threads = 10;
+        let mut handles = Vec::new();
+
+        for i in 0..num_threads {
+            let thread_target = target_dest.clone();
+            let thread_dir = tempdir().unwrap();
+            let tmp_file = thread_dir.path().join(format!("tmp_{}.tmp", i));
+            let thread_content = format!("thread_unique_payload_{}", i).into_bytes();
+            fs::write(&tmp_file, &thread_content).unwrap();
+
+            // Move the temp file out of thread_dir so thread_dir doesn't delete it
+            let final_tmp = dst_dir.path().join(format!(".chronicle_tmp_test_{}", i));
+            fs::rename(&tmp_file, &final_tmp).unwrap();
+
+            handles.push(std::thread::spawn(move || {
+                commit_non_overwriting(&final_tmp, &thread_target)
+            }));
+        }
+
+        let mut committed_paths = Vec::new();
+        for h in handles {
+            let res = h.join().unwrap();
+            assert!(res.is_ok(), "Commit failed: {:?}", res.err());
+            let path = res.unwrap();
+            assert!(path.exists());
+            committed_paths.push(path);
+        }
+
+        // All 10 threads must have committed to unique, distinct paths!
+        assert_eq!(committed_paths.len(), num_threads);
+        let mut unique_paths = committed_paths.clone();
+        unique_paths.sort();
+        unique_paths.dedup();
+        assert_eq!(unique_paths.len(), num_threads, "Every concurrent commit must yield a unique path without collision or overwrite");
+
+        // Verify all 10 distinct contents exist on disk intact
+        let mut found_contents = Vec::new();
+        for path in &committed_paths {
+            let text = fs::read_to_string(path).unwrap();
+            found_contents.push(text);
+        }
+        for i in 0..num_threads {
+            let expected = format!("thread_unique_payload_{}", i);
+            assert!(found_contents.contains(&expected), "Content from thread {} must be preserved intact", i);
+        }
     }
 }

@@ -26,6 +26,7 @@ pub enum FileStatus {
     Verified,
     Failed,
     Skipped,
+    Excluded,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,9 +94,17 @@ pub struct ScanErrorItem {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExcludedItem {
+    pub path: PathBuf,
+    pub relative_path: PathBuf,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanResult {
     pub files: Vec<ScannedFile>,
     pub errors: Vec<ScanErrorItem>,
+    pub excluded: Vec<ExcludedItem>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,6 +159,7 @@ pub struct JobSummary {
     pub duplicate_content_count: u64,
     pub unique_folders_count: u64,
     pub scan_error_count: u64,
+    pub excluded_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -161,6 +171,7 @@ pub struct JobProgress {
     pub copied_files: u64,
     pub copied_bytes: u64,
     pub failed_files: u64,
+    pub excluded_files: u64,
     pub current_file: Option<String>,
     pub current_operation: String,
     pub speed_bytes_per_sec: u64,
@@ -179,6 +190,7 @@ pub struct JobRecord {
     pub copied_files: u64,
     pub copied_bytes: u64,
     pub failed_files: u64,
+    pub excluded_files: u64,
     pub created_at: i64,
     pub completed_at: Option<i64>,
 }

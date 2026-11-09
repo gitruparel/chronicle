@@ -92,3 +92,11 @@
 - [x] 9.6 **Bounded Worker Concurrency (Finding 6)**: Copy loop utilizes `tokio::sync::Semaphore` dynamically bounded by user-configured `worker_count`.
 - [x] 9.7 **Mid-Stream Pause Checking (Finding 7)**: Copy streaming loop cooperatively pauses during chunk transfer via atomic pause flag.
 - [x] 9.8 **End-to-End Retry Workflow (Finding 8)**: Re-triggers execution for failed files and updates database state.
+
+## Phase 10: Deep Reliability Hardening & CI Validation
+- [x] 10.1 **Kernel-Level Atomic No-Replace Commit**: Replaced TOCTOU `exists() -> rename()` in `copy_engine` with native Win32 `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING`. Rejects collisions at the OS kernel level (`ERROR_ALREADY_EXISTS`) and allocates suffixed names deterministically without race hazards.
+- [x] 10.2 **Complete Discovered Accounting**: Scanner records regular files, unreadable traversal errors (`ScanErrorItem`), and policy exclusions (`ExcludedItem` for directory junctions, symlinks, and special devices). Persisted into `job_files` as `failed` and `excluded` to demonstrate zero silent omissions.
+- [x] 10.3 **Comprehensive Timezone & QuickTime Semantics**: Preserves camera scene wall-clock date for EXIF `DateTimeOriginal` with explicit offsets; converts QuickTime UTC container tags (`CreateDate`, `TrackCreateDate`, `Matroska:DateUTC`) and timestamps with `Z` or `+00:00` into the user's local calendar day.
+- [x] 10.4 **Multi-Stage Crash Recovery & Self-Healing**: Destination directory scans clean up orphaned `.chronicle_tmp_*` files, copies completed before database status update self-heal to `Verified`, and corrupted destinations are quarantined to `.chronicle_corrupted_*` with records reverted to `Pending`.
+- [x] 10.5 **Production ExifTool Resource Resolution**: Wired `ExifToolManager::from_app_handle` to Tauri 2's runtime resource resolver API (`app.path().resolve("resources/exiftool.exe", BaseDirectory::Resource)`).
+- [x] 10.6 **GitHub Actions CI Automation**: Added `.github/workflows/ci.yml` running on `windows-latest` executing Node setup, `npm ci`, typecheck, production build, and `cargo test --verbose -- --nocapture`.

@@ -117,8 +117,8 @@ impl JobManager {
         // 3. Plan destinations and resolve collisions
         let planned_files = plan_destinations(destination, resolved_files);
 
-        // 4. Save to database including any traversal/scan errors
-        self.db.save_planned_files(job_id, &planned_files, &scan_result.errors)
+        // 4. Save to database including any traversal/scan errors and policy-excluded items
+        self.db.save_planned_files(job_id, &planned_files, &scan_result.errors, &scan_result.excluded)
             .map_err(|e| format!("Database save error: {}", e))?;
 
         self.db.update_job_status(job_id, JobStatus::Analysed)
@@ -177,6 +177,7 @@ impl JobManager {
 
         let total_files = files.len() as u64;
         let total_bytes: u64 = files.iter().map(|f| f.size_bytes).sum();
+        let excluded_count = files.iter().filter(|f| f.status == FileStatus::Excluded).count() as u64;
 
         // Concurrency limiter: bounded worker pool
         let worker_limit = options.worker_count.clamp(1, 16);
@@ -200,8 +201,8 @@ impl JobManager {
             let mut tasks = Vec::new();
 
             for file in files {
-                // If file is already verified, skip
-                if file.status == FileStatus::Verified {
+                // If file is already verified or policy-excluded, do not copy
+                if file.status == FileStatus::Verified || file.status == FileStatus::Excluded {
                     continue;
                 }
 
@@ -250,6 +251,7 @@ impl JobManager {
                         copied_files: c_copied_f.load(Ordering::SeqCst),
                         copied_bytes: c_copied_b.load(Ordering::SeqCst),
                         failed_files: c_failed_f.load(Ordering::SeqCst),
+                        excluded_files: excluded_count,
                         current_file: Some(file.filename.clone()),
                         current_operation: format!("Copying {} to {}", file.filename, file.destination_folder),
                         speed_bytes_per_sec: 0,
@@ -328,6 +330,7 @@ impl JobManager {
                 copied_files: final_copied,
                 copied_bytes: copied_bytes.load(Ordering::SeqCst),
                 failed_files: final_failed,
+                excluded_files: excluded_count,
                 current_file: None,
                 current_operation: format!("Job finished with status: {:?}", final_status),
                 speed_bytes_per_sec: 0,
