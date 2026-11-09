@@ -60,7 +60,8 @@ fn test_end_to_end_pipeline_with_diverse_fixtures() {
     fs::write(src.join("corrupt_image.jpg"), &[0xFF, 0xD8, 0x00, 0x11, 0x22]).unwrap();
 
     // 3. Run recursive scanner
-    let scanned = scan_directory(src, true).unwrap();
+    let scan_res = scan_directory(src, true).unwrap();
+    let scanned = scan_res.files;
     assert_eq!(scanned.len(), 11, "Scanner must discover every regular file without omission");
 
     // 4. Resolve dates with simulated metadata
@@ -103,7 +104,7 @@ fn test_end_to_end_pipeline_with_diverse_fixtures() {
     let db = Database::open(&db_path).unwrap();
     let job_id = "test-job-e2e";
     db.create_job(job_id, "E2E Test Job", src, dst, &JobOptions::default()).unwrap();
-    db.save_planned_files(job_id, &planned).unwrap();
+    db.save_planned_files(job_id, &planned, &scan_res.errors).unwrap();
 
     // 7. Execute copies through the copy engine
     let copy_opts = CopyOptions::default();
@@ -112,6 +113,7 @@ fn test_end_to_end_pipeline_with_diverse_fixtures() {
             &file.source_path,
             &file.destination_path,
             &copy_opts,
+            None,
             None,
             |_| {},
         );
@@ -168,7 +170,7 @@ fn test_timezone_interpretation_and_wall_clock_rules() {
     // 4. QuickTime creation date with UTC marker Z
     let (d4, tz4) = parse_timestamp_to_date("2024-05-18T18:00:00Z").unwrap();
     assert_eq!(d4, "2024-05-18");
-    assert_eq!(tz4, Some("UTC (Z)".to_string()));
+    assert_eq!(tz4, Some("UTC converted to Local".to_string()));
 
     // 5. Invalid corrupt dates: 0000:00:00 or garbage
     assert!(parse_timestamp_to_date("0000:00:00 00:00:00").is_none());
@@ -266,7 +268,7 @@ fn test_crash_recovery_and_reconciliation() {
             },
         ];
 
-        db.save_planned_files(job_id, &files).unwrap();
+        db.save_planned_files(job_id, &files, &[]).unwrap();
         // Mark job as running
         db.update_job_status(job_id, chronicle_lib::types::JobStatus::Running).unwrap();
     } // db is dropped here (simulating crash)
@@ -305,7 +307,8 @@ fn test_large_synthetic_dataset_10000_files() {
     }
 
     let start_scan = std::time::Instant::now();
-    let scanned = scan_directory(root, true).unwrap();
+    let scan_res = scan_directory(root, true).unwrap();
+    let scanned = scan_res.files;
     let scan_duration = start_scan.elapsed();
 
     assert_eq!(scanned.len(), num_files);

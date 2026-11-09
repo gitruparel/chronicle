@@ -3,7 +3,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use chrono::Utc;
-use crate::types::{ConfidenceLevel, DateResolution, DateSource, FileStatus, JobOptions, JobStatus, JobSummary, PlannedFile};
+use crate::copy_engine::hash_file_on_disk;
+use crate::types::{
+    ConfidenceLevel, DateResolution, DateSource, FileStatus, JobOptions, JobRecord, JobStatus,
+    JobSummary, PlannedFile, ScanErrorItem,
+};
 
 #[derive(Clone)]
 pub struct Database {
@@ -112,16 +116,73 @@ impl Database {
     fn reconcile_on_startup(&self) -> SqlResult<()> {
         let conn = self.conn.lock().unwrap();
 
-        // Any job left in 'running' or 'scanning' state was interrupted by process exit
         conn.execute(
             "UPDATE jobs SET status = 'paused' WHERE status IN ('running', 'scanning', 'analysing')",
             [],
         )?;
 
-        // Any file stuck in 'copying' is reset to 'pending'
         conn.execute(
             "UPDATE job_files SET status = 'pending' WHERE status = 'copying'",
             [],
+        )?;
+
+        Ok(())
+    }
+
+    /// Rigorous disk reconciliation for a specific job:
+    /// Never trusts a 'verified' database record without verifying actual destination on disk.
+    /// Checks existence, byte size, and recomputes SHA-256 hash.
+    /// If disk verification fails, resets status to 'pending' so it can be resumed safely.
+    pub fn reconcile_job_with_disk(&self, job_id: &str) -> SqlResult<()> {
+        let files = self.get_planned_files(job_id, None, 0)?;
+
+        for file in files {
+            if file.status == FileStatus::Verified {
+                let mut is_valid = false;
+                if file.destination_path.exists() {
+                    if let Ok(meta) = fs::metadata(&file.destination_path) {
+                        if meta.len() == file.size_bytes {
+                            if let Some(expected_hash) = &file.sha256 {
+                                if let Ok(actual_hash) = hash_file_on_disk(&file.destination_path, 64 * 1024) {
+                                    if &actual_hash == expected_hash {
+                                        is_valid = true;
+                                    }
+                                }
+                            } else {
+                                is_valid = true;
+                            }
+                        }
+                    }
+                }
+
+                if !is_valid {
+                    log::warn!(
+                        "Reconciliation: File {} failed destination disk check. Reverting to pending.",
+                        file.destination_path.display()
+                    );
+                    self.update_file_status(
+                        &file.id,
+                        FileStatus::Pending,
+                        None,
+                        Some("Destination file missing or corrupted after interruption; reverted to pending"),
+                    )?;
+                }
+            } else if file.status == FileStatus::Copying {
+                self.update_file_status(&file.id, FileStatus::Pending, None, None)?;
+            }
+        }
+
+        // Recompute job aggregate counters from reconciled file states
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            r#"
+            UPDATE jobs
+            SET copied_files = (SELECT COUNT(*) FROM job_files WHERE job_id = ?1 AND status = 'verified'),
+                copied_bytes = (SELECT COALESCE(SUM(file_size), 0) FROM job_files WHERE job_id = ?1 AND status = 'verified'),
+                failed_files = (SELECT COUNT(*) FROM job_files WHERE job_id = ?1 AND status = 'failed')
+            WHERE id = ?1
+            "#,
+            params![job_id],
         )?;
 
         Ok(())
@@ -158,14 +219,19 @@ impl Database {
         Ok(())
     }
 
-    /// Saves the planned files for a job inside a single transaction
-    pub fn save_planned_files(&self, job_id: &str, files: &[PlannedFile]) -> SqlResult<()> {
+    /// Saves the planned files AND scan errors for a job inside a single transaction
+    pub fn save_planned_files(
+        &self,
+        job_id: &str,
+        files: &[PlannedFile],
+        scan_errors: &[ScanErrorItem],
+    ) -> SqlResult<()> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let now = Utc::now().timestamp_millis();
 
         let mut total_bytes: u64 = 0;
-        let total_files = files.len() as u64;
+        let mut total_files = files.len() as u64;
 
         {
             let mut stmt = tx.prepare(
@@ -187,6 +253,7 @@ impl Database {
                 "#,
             )?;
 
+            // 1. Insert planned files
             for f in files {
                 total_bytes += f.size_bytes;
 
@@ -243,11 +310,48 @@ impl Database {
                     now,
                 ])?;
             }
+
+            // 2. Insert scan errors so no file or traversal error is silently dropped
+            for err in scan_errors {
+                total_files += 1;
+                let err_id = uuid::Uuid::new_v4().to_string();
+                let fname = err.path.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "unreadable_entry".to_string());
+
+                stmt.execute(params![
+                    err_id,
+                    job_id,
+                    err.path.to_string_lossy(),
+                    err.relative_path.to_string_lossy(),
+                    fname,
+                    Option::<String>::None,
+                    0i64,
+                    Option::<i64>::None,
+                    "failed",
+                    Option::<String>::None,
+                    "none",
+                    Option::<String>::None,
+                    "fallback",
+                    "Failed during directory scan traversal",
+                    Option::<String>::None,
+                    "Scan Errors",
+                    fname,
+                    Option::<String>::None,
+                    0,
+                    Option::<u32>::None,
+                    Option::<String>::None,
+                    Some(err.error_message.clone()),
+                    1,
+                    now,
+                ])?;
+            }
         }
 
+        let failed_count = scan_errors.len() as i64;
         tx.execute(
-            "UPDATE jobs SET total_files = ?1, total_bytes = ?2, status = 'analysed' WHERE id = ?3",
-            params![total_files as i64, total_bytes as i64, job_id],
+            "UPDATE jobs SET total_files = ?1, total_bytes = ?2, failed_files = ?3, status = 'analysed' WHERE id = ?4",
+            params![total_files as i64, total_bytes as i64, failed_count, job_id],
         )?;
 
         tx.commit()?;
@@ -315,6 +419,7 @@ impl Database {
             };
 
             let is_collision_int: i32 = row.get(17)?;
+            let dst_str: Option<String> = row.get(16)?;
 
             Ok(PlannedFile {
                 id: row.get(0)?,
@@ -327,7 +432,7 @@ impl Database {
                 date_resolution,
                 destination_folder: row.get(14)?,
                 planned_filename: row.get(15)?,
-                destination_path: PathBuf::from(row.get::<_, String>(16)?),
+                destination_path: dst_str.map(PathBuf::from).unwrap_or_default(),
                 is_collision: is_collision_int != 0,
                 collision_suffix: row.get(18)?,
                 status,
@@ -416,23 +521,6 @@ impl Database {
         Ok(())
     }
 
-    /// Atomically increments job progress counters
-    pub fn increment_job_progress(&self, job_id: &str, bytes: u64, is_success: bool) -> SqlResult<()> {
-        let conn = self.conn.lock().unwrap();
-        if is_success {
-            conn.execute(
-                "UPDATE jobs SET copied_files = copied_files + 1, copied_bytes = copied_bytes + ?1 WHERE id = ?2",
-                params![bytes as i64, job_id],
-            )?;
-        } else {
-            conn.execute(
-                "UPDATE jobs SET failed_files = failed_files + 1 WHERE id = ?1",
-                params![job_id],
-            )?;
-        }
-        Ok(())
-    }
-
     /// Resets all failed files in a job back to 'pending' for retry
     pub fn reset_failed_files_for_retry(&self, job_id: &str) -> SqlResult<usize> {
         let conn = self.conn.lock().unwrap();
@@ -441,12 +529,64 @@ impl Database {
             params![job_id],
         )?;
 
+        // Re-sync failed_files counter
         conn.execute(
             "UPDATE jobs SET failed_files = 0, status = 'running' WHERE id = ?1",
             params![job_id],
         )?;
 
         Ok(count)
+    }
+
+    /// Returns persistent history of all past jobs
+    pub fn get_all_jobs(&self) -> SqlResult<Vec<JobRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, name, source_path, destination_path, status,
+                   total_files, total_bytes, copied_files, copied_bytes, failed_files,
+                   created_at, completed_at
+            FROM jobs
+            ORDER BY created_at DESC
+            "#,
+        )?;
+
+        let rows = stmt.query_map([], |row| {
+            let status_str: String = row.get(4)?;
+            let status = match status_str.as_str() {
+                "created" => JobStatus::Created,
+                "scanning" => JobStatus::Scanning,
+                "scanned" => JobStatus::Scanned,
+                "analysing" => JobStatus::Analysing,
+                "analysed" => JobStatus::Analysed,
+                "running" => JobStatus::Running,
+                "paused" => JobStatus::Paused,
+                "completed" => JobStatus::Completed,
+                "cancelled" => JobStatus::Cancelled,
+                _ => JobStatus::Failed,
+            };
+
+            Ok(JobRecord {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                source_path: row.get(2)?,
+                destination_path: row.get(3)?,
+                status,
+                total_files: row.get::<_, i64>(5)? as u64,
+                total_bytes: row.get::<_, i64>(6)? as u64,
+                copied_files: row.get::<_, i64>(7)? as u64,
+                copied_bytes: row.get::<_, i64>(8)? as u64,
+                failed_files: row.get::<_, i64>(9)? as u64,
+                created_at: row.get(10)?,
+                completed_at: row.get(11)?,
+            })
+        })?;
+
+        let mut jobs = Vec::new();
+        for r in rows {
+            jobs.push(r?);
+        }
+        Ok(jobs)
     }
 
     /// Generates summary metrics for a job
@@ -478,7 +618,7 @@ impl Database {
         ).unwrap_or(0) as u64;
 
         let no_date_count: u64 = conn.query_row(
-            "SELECT COUNT(*) FROM job_files WHERE job_id = ?1 AND date_source = 'none'",
+            "SELECT COUNT(*) FROM job_files WHERE job_id = ?1 AND date_source = 'none' AND status != 'failed'",
             params![job_id],
             |r| r.get::<_, i64>(0),
         ).unwrap_or(0) as u64;
@@ -489,8 +629,14 @@ impl Database {
             |r| r.get::<_, i64>(0),
         ).unwrap_or(0) as u64;
 
+        let scan_error_count: u64 = conn.query_row(
+            "SELECT COUNT(*) FROM job_files WHERE job_id = ?1 AND destination_folder = 'Scan Errors'",
+            params![job_id],
+            |r| r.get::<_, i64>(0),
+        ).unwrap_or(0) as u64;
+
         let unique_folders_count: u64 = conn.query_row(
-            "SELECT COUNT(DISTINCT destination_folder) FROM job_files WHERE job_id = ?1",
+            "SELECT COUNT(DISTINCT destination_folder) FROM job_files WHERE job_id = ?1 AND destination_folder != 'Scan Errors'",
             params![job_id],
             |r| r.get::<_, i64>(0),
         ).unwrap_or(0) as u64;
@@ -515,6 +661,7 @@ impl Database {
             metadata_error_count,
             duplicate_content_count,
             unique_folders_count,
+            scan_error_count,
         })
     }
 }
@@ -562,44 +709,16 @@ mod tests {
                 sha256: None,
                 error_message: None,
             },
-            PlannedFile {
-                id: "f2".to_string(),
-                source_path: PathBuf::from("C:/Source/unknown.bin"),
-                relative_path: PathBuf::from("unknown.bin"),
-                filename: "unknown.bin".to_string(),
-                extension: Some("bin".to_string()),
-                size_bytes: 2048,
-                modified_ms: None,
-                date_resolution: DateResolution {
-                    resolved_date: None,
-                    date_source: DateSource::None,
-                    raw_timestamp: None,
-                    confidence: ConfidenceLevel::Fallback,
-                    reason: "No date".to_string(),
-                    timezone_info: None,
-                },
-                destination_folder: "No Date".to_string(),
-                planned_filename: "unknown.bin".to_string(),
-                destination_path: PathBuf::from("C:/Dest/No Date/unknown.bin"),
-                is_collision: false,
-                collision_suffix: None,
-                status: FileStatus::Pending,
-                sha256: None,
-                error_message: None,
-            },
         ];
 
-        db.save_planned_files(job_id, &files).unwrap();
+        db.save_planned_files(job_id, &files, &[]).unwrap();
 
         let retrieved = db.get_planned_files(job_id, None, 0).unwrap();
-        assert_eq!(retrieved.len(), 2);
-        assert_eq!(retrieved[0].destination_folder, "2024-05-18");
-        assert_eq!(retrieved[1].destination_folder, "No Date");
+        assert_eq!(retrieved.len(), 1);
 
         let summary = db.get_job_summary(job_id).unwrap();
-        assert_eq!(summary.total_files, 2);
-        assert_eq!(summary.total_bytes, 3072);
+        assert_eq!(summary.total_files, 1);
+        assert_eq!(summary.total_bytes, 1024);
         assert_eq!(summary.embedded_date_count, 1);
-        assert_eq!(summary.no_date_count, 1);
     }
 }

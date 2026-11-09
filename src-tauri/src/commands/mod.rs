@@ -6,7 +6,7 @@ use crate::jobs::JobManager;
 use crate::metadata::ExifToolManager;
 use crate::reports::ReportGenerator;
 use crate::scanner::check_overlap;
-use crate::types::{JobOptions, JobSummary, OverlapCheckResult, PathValidationResult, PlannedFile};
+use crate::types::{JobOptions, JobRecord, JobSummary, OverlapCheckResult, PathValidationResult, PlannedFile};
 
 pub struct AppState {
     pub job_manager: JobManager,
@@ -124,6 +124,14 @@ pub fn get_job_summary_cmd(
 }
 
 #[tauri::command]
+pub fn get_all_jobs_cmd(
+    state: State<'_, AppState>,
+) -> Result<Vec<JobRecord>, String> {
+    state.job_manager.get_db().get_all_jobs()
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn start_copy_job(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -158,12 +166,18 @@ pub async fn cancel_copy_job(
 }
 
 #[tauri::command]
-pub fn retry_failed_job(
+pub async fn retry_failed_job(
+    app: AppHandle,
     state: State<'_, AppState>,
     job_id: String,
+    options: JobOptions,
 ) -> Result<usize, String> {
-    state.job_manager.get_db().reset_failed_files_for_retry(&job_id)
-        .map_err(|e| e.to_string())
+    let count = state.job_manager.get_db().reset_failed_files_for_retry(&job_id)
+        .map_err(|e| e.to_string())?;
+
+    // Restart execution for pending files
+    state.job_manager.start_execution(app, job_id, options).await?;
+    Ok(count)
 }
 
 #[tauri::command]

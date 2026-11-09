@@ -86,6 +86,19 @@ pub struct ScannedFile {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanErrorItem {
+    pub path: PathBuf,
+    pub relative_path: PathBuf,
+    pub error_message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanResult {
+    pub files: Vec<ScannedFile>,
+    pub errors: Vec<ScanErrorItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlannedFile {
     pub id: String,
     pub source_path: PathBuf,
@@ -136,6 +149,7 @@ pub struct JobSummary {
     pub metadata_error_count: u64,
     pub duplicate_content_count: u64,
     pub unique_folders_count: u64,
+    pub scan_error_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -151,6 +165,22 @@ pub struct JobProgress {
     pub current_operation: String,
     pub speed_bytes_per_sec: u64,
     pub eta_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobRecord {
+    pub id: String,
+    pub name: String,
+    pub source_path: String,
+    pub destination_path: String,
+    pub status: JobStatus,
+    pub total_files: u64,
+    pub total_bytes: u64,
+    pub copied_files: u64,
+    pub copied_bytes: u64,
+    pub failed_files: u64,
+    pub created_at: i64,
+    pub completed_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

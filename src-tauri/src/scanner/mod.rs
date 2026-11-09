@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 use walkdir::WalkDir;
 use uuid::Uuid;
-use crate::types::{ScannedFile, OverlapCheckResult};
+use crate::types::{OverlapCheckResult, ScanErrorItem, ScanResult, ScannedFile};
 
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt;
@@ -72,9 +72,8 @@ pub fn is_reparse_point_or_symlink(entry: &walkdir::DirEntry) -> bool {
 }
 
 /// Recursively scans the source directory for all regular files.
-/// Never follows symlinks or directory junctions by default, preventing recursion loops.
-/// Preserves zero-byte, hidden, read-only, and extensionless files.
-pub fn scan_directory(source_root: &Path, recursive: bool) -> Result<Vec<ScannedFile>, String> {
+/// Never silently omits files. Traversal and metadata errors are explicitly collected and reported.
+pub fn scan_directory(source_root: &Path, recursive: bool) -> Result<ScanResult, String> {
     if !source_root.exists() {
         return Err(format!("Source path does not exist: {}", source_root.display()));
     }
@@ -87,6 +86,7 @@ pub fn scan_directory(source_root: &Path, recursive: bool) -> Result<Vec<Scanned
 
     let max_depth = if recursive { usize::MAX } else { 1 };
     let mut files = Vec::new();
+    let mut errors = Vec::new();
 
     let walker = WalkDir::new(&canonical_root)
         .max_depth(max_depth)
@@ -97,42 +97,54 @@ pub fn scan_directory(source_root: &Path, recursive: bool) -> Result<Vec<Scanned
         let entry = match entry_result {
             Ok(e) => e,
             Err(e) => {
-                log::warn!("Skipping unreadable entry: {}", e);
+                let bad_path = e.path().unwrap_or(source_root).to_path_buf();
+                let rel = bad_path.strip_prefix(&canonical_root).unwrap_or(&bad_path).to_path_buf();
+                log::warn!("Scan traversal error at {}: {}", bad_path.display(), e);
+                errors.push(ScanErrorItem {
+                    path: bad_path,
+                    relative_path: rel,
+                    error_message: format!("Directory traversal error: {}", e),
+                });
                 continue;
             }
         };
 
-        // If directory is a symlink or junction, do not traverse into it
+        // If directory is a symlink or junction, do not traverse into it to prevent recursion loops
         if entry.file_type().is_dir() {
             if entry.path() != canonical_root && is_reparse_point_or_symlink(&entry) {
-                log::info!("Skipping directory junction/symlink: {}", entry.path().display());
+                log::info!("Skipping directory junction/symlink loop: {}", entry.path().display());
             }
             continue;
         }
 
-        // We only process regular files (or symlinks to files, which we treat as non-regular unless desired)
+        // Only process regular files
         if !entry.file_type().is_file() {
             continue;
         }
 
-        // Avoid following file-level symlinks to prevent copying targets outside or duplicated
+        // Avoid following file-level symlinks
         if is_reparse_point_or_symlink(&entry) {
             log::info!("Skipping reparse point/symlink file: {}", entry.path().display());
             continue;
         }
 
         let path = entry.path().to_path_buf();
-        let metadata = match fs::metadata(&path) {
-            Ok(m) => m,
-            Err(e) => {
-                log::warn!("Could not read metadata for {}: {}", path.display(), e);
-                continue;
-            }
-        };
-
         let relative_path = path.strip_prefix(&canonical_root)
             .unwrap_or(&path)
             .to_path_buf();
+
+        let metadata = match fs::metadata(&path) {
+            Ok(m) => m,
+            Err(e) => {
+                log::warn!("Metadata read error for {}: {}", path.display(), e);
+                errors.push(ScanErrorItem {
+                    path,
+                    relative_path,
+                    error_message: format!("Failed to read filesystem metadata: {}", e),
+                });
+                continue;
+            }
+        };
 
         let filename = path.file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -169,7 +181,7 @@ pub fn scan_directory(source_root: &Path, recursive: bool) -> Result<Vec<Scanned
         });
     }
 
-    Ok(files)
+    Ok(ScanResult { files, errors })
 }
 
 #[cfg(test)]
@@ -204,7 +216,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_finds_all_file_types() {
+    fn test_scan_finds_all_file_types_and_reports_errors() {
         let dir = tempdir().unwrap();
         let root = dir.path();
 
@@ -217,13 +229,14 @@ mod tests {
         fs::create_dir(&sub).unwrap();
         fs::write(sub.join("nested.jpg"), "photo").unwrap();
 
-        let scanned = scan_directory(root, true).unwrap();
-        assert_eq!(scanned.len(), 5);
+        let res = scan_directory(root, true).unwrap();
+        assert_eq!(res.files.len(), 5);
+        assert_eq!(res.errors.len(), 0);
 
-        let zero_byte = scanned.iter().find(|f| f.filename == "empty.bin").unwrap();
+        let zero_byte = res.files.iter().find(|f| f.filename == "empty.bin").unwrap();
         assert_eq!(zero_byte.size_bytes, 0);
 
-        let no_ext = scanned.iter().find(|f| f.filename == "no_extension").unwrap();
+        let no_ext = res.files.iter().find(|f| f.filename == "no_extension").unwrap();
         assert_eq!(no_ext.extension, None);
     }
 }

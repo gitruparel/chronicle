@@ -87,15 +87,21 @@ export function CompletionPage({
     <div className="max-w-4xl mx-auto space-y-6 py-4">
       {/* Status Hero Card */}
       <div className="rounded-2xl border border-border bg-surface p-6 text-center space-y-3">
-        <div className="mx-auto w-12 h-12 rounded-full bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center text-emerald-400">
-          <CheckCircle2 className="h-6 w-6" />
+        <div
+          className={`mx-auto w-12 h-12 rounded-full flex items-center justify-center ${
+            isSuccess
+              ? 'bg-emerald-500/10 border border-emerald-500/20 text-emerald-400'
+              : 'bg-amber-500/10 border border-amber-500/20 text-amber-400'
+          }`}
+        >
+          {isSuccess ? <CheckCircle2 className="h-6 w-6" /> : <AlertTriangle className="h-6 w-6" />}
         </div>
         <div>
           <h2 className="text-xl font-bold text-text-primary tracking-tight">
-            {isSuccess ? 'Organization Completed' : `Job Finished (${status})`}
+            {isSuccess ? 'Organization Completed' : `Job Finished with Status: ${status.toUpperCase()}`}
           </h2>
           <p className="text-xs text-text-secondary mt-1">
-            All eligible files have been verified, checksummed, and copied into destination date folders.
+            Every discovered file is accounted for: verified copies have matching SHA-256 and physical disk commit.
           </p>
         </div>
 
@@ -115,7 +121,7 @@ export function CompletionPage({
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         <div className="rounded-xl border border-border bg-surface p-4 space-y-1">
           <span className="text-[11px] text-text-muted flex items-center gap-1.5">
-            <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" /> Total Copied
+            <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" /> Total Verified
           </span>
           <div className="text-lg font-bold text-text-primary font-mono">
             {summary.total_files.toLocaleString()}
@@ -140,7 +146,7 @@ export function CompletionPage({
           <div className="text-lg font-bold text-text-primary font-mono">
             {summary.mtime_date_count.toLocaleString()}
           </div>
-          <span className="text-[10px] text-text-muted">Filesystem timestamps</span>
+          <span className="text-[10px] text-text-muted">Local filesystem mtime</span>
         </div>
 
         <div className="rounded-xl border border-border bg-surface p-4 space-y-1">
@@ -150,7 +156,7 @@ export function CompletionPage({
           <div className="text-lg font-bold text-text-primary font-mono">
             {summary.unique_folders_count.toLocaleString()}
           </div>
-          <span className="text-[10px] text-text-muted">Folders created</span>
+          <span className="text-[10px] text-text-muted">Unique YYYY-MM-DD</span>
         </div>
       </div>
 
@@ -173,17 +179,17 @@ export function CompletionPage({
           <div className="font-semibold text-text-primary">
             {summary.no_date_count.toLocaleString()} files
           </div>
-          <p className="text-[10px] text-text-muted">Stored inside No Date/ folder</p>
+          <p className="text-[10px] text-text-muted">Organized in No Date/ folder</p>
         </div>
 
         <div className="rounded-xl border border-border bg-surface p-3 space-y-1 text-xs">
           <span className="text-text-muted flex items-center gap-1.5">
-            <AlertTriangle className="h-3.5 w-3.5 text-amber-400" /> Metadata Warnings
+            <AlertTriangle className="h-3.5 w-3.5 text-amber-400" /> Failures / Errors
           </span>
           <div className="font-semibold text-text-primary">
-            {summary.metadata_error_count.toLocaleString()} warnings
+            {(summary.scan_error_count + summary.metadata_error_count).toLocaleString()} issues
           </div>
-          <p className="text-[10px] text-text-muted">Fell back safely; not omitted</p>
+          <p className="text-[10px] text-text-muted">All tracked in database and reports</p>
         </div>
       </div>
 
@@ -212,13 +218,13 @@ export function CompletionPage({
             Export JSON Report
           </button>
 
-          {summary.metadata_error_count > 0 && (
+          {(!isSuccess || summary.scan_error_count > 0) && (
             <button
               onClick={onRetry}
               className="flex items-center gap-2 px-4 py-2 rounded-lg border border-amber-500/30 bg-amber-500/10 hover:bg-amber-500/20 text-xs font-medium text-amber-400 transition-colors"
             >
               <RotateCcw className="h-4 w-4" />
-              Retry Incomplete Files
+              Retry Failed Files
             </button>
           )}
 

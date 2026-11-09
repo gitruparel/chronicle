@@ -20,38 +20,38 @@ import type { JobOptions, JobStatus, JobSummary } from './types';
 
 type ActiveTab = 'new_job' | 'preview' | 'executing' | 'completed' | 'history' | 'settings';
 
-interface PastJobRecord {
-  id: string;
-  date: string;
-  source: string;
-  destination: string;
-  summary: JobSummary;
-  status: string;
-}
-
 export function App() {
   const [activeTab, setActiveTab] = useState<ActiveTab>('new_job');
-  const [theme, setTheme] = useState<'dark' | 'light'>('dark');
+  const [theme, setTheme] = useState<'dark' | 'light'>(() => {
+    return (localStorage.getItem('chronicle_theme') as 'dark' | 'light') || 'dark';
+  });
 
   // Active Job State
   const [currentJobId, setCurrentJobId] = useState<string | null>(null);
   const [currentSummary, setCurrentSummary] = useState<JobSummary | null>(null);
-  const [currentSource, setCurrentSource] = useState<string>('');
   const [currentDestination, setCurrentDestination] = useState<string>('');
-  const [currentOptions, setCurrentOptions] = useState<JobOptions>({
-    recursive: true,
-    copy_duplicates: true,
-    mtime_fallback: true,
-    verify_hash: true,
-    worker_count: 4,
+  const [currentOptions, setCurrentOptions] = useState<JobOptions>(() => {
+    const saved = localStorage.getItem('chronicle_options');
+    if (saved) {
+      try {
+        return JSON.parse(saved);
+      } catch {
+        // fallback
+      }
+    }
+    return {
+      recursive: true,
+      copy_duplicates: true,
+      mtime_fallback: true,
+      verify_hash: true,
+      worker_count: 4,
+    };
   });
+
+  const [isRetry, setIsRetry] = useState(false);
   const [completionStatus, setCompletionStatus] = useState<JobStatus>('completed');
 
-  // Job History
-  const [pastJobs, setPastJobs] = useState<PastJobRecord[]>([]);
-
   useEffect(() => {
-    // Theme sync
     const root = document.documentElement;
     if (theme === 'dark') {
       root.classList.add('dark');
@@ -60,7 +60,13 @@ export function App() {
       root.classList.add('light');
       root.classList.remove('dark');
     }
+    localStorage.setItem('chronicle_theme', theme);
   }, [theme]);
+
+  const handleOptionsChange = (newOptions: JobOptions) => {
+    setCurrentOptions(newOptions);
+    localStorage.setItem('chronicle_options', JSON.stringify(newOptions));
+  };
 
   const toggleTheme = () => {
     setTheme((prev) => (prev === 'dark' ? 'light' : 'dark'));
@@ -69,47 +75,37 @@ export function App() {
   const handleScanComplete = (
     jobId: string,
     summary: JobSummary,
-    source: string,
+    _source: string,
     destination: string,
     options: JobOptions
   ) => {
     setCurrentJobId(jobId);
     setCurrentSummary(summary);
-    setCurrentSource(source);
     setCurrentDestination(destination);
     setCurrentOptions(options);
+    setIsRetry(false);
     setActiveTab('preview');
   };
 
   const handleConfirmCopy = () => {
+    setIsRetry(false);
     setActiveTab('executing');
   };
 
   const handleCopyFinished = (status: JobStatus) => {
     setCompletionStatus(status);
-    if (currentJobId && currentSummary) {
-      setPastJobs((prev) => [
-        {
-          id: currentJobId,
-          date: new Date().toLocaleDateString(),
-          source: currentSource,
-          destination: currentDestination,
-          summary: currentSummary,
-          status,
-        },
-        ...prev,
-      ]);
-    }
     setActiveTab('completed');
   };
 
   const handleStartNewJob = () => {
     setCurrentJobId(null);
     setCurrentSummary(null);
+    setIsRetry(false);
     setActiveTab('new_job');
   };
 
   const handleRetry = () => {
+    setIsRetry(true);
     setActiveTab('executing');
   };
 
@@ -129,7 +125,7 @@ export function App() {
             v1.0.0
           </span>
           <span className="hidden sm:inline-flex items-center gap-1 text-[11px] text-text-muted">
-            <ShieldCheck className="h-3 w-3 text-emerald-400" /> Offline-First Organizer
+            <ShieldCheck className="h-3 w-3 text-emerald-400" /> Offline-First Universal Organizer
           </span>
         </div>
 
@@ -167,7 +163,7 @@ export function App() {
               className="flex items-center gap-1.5 px-3 py-1 rounded-md bg-surface text-accent font-medium shadow-sm"
             >
               <Activity className="h-3.5 w-3.5 animate-pulse" />
-              Copying...
+              {isRetry ? 'Retrying...' : 'Copying...'}
             </button>
           )}
 
@@ -238,6 +234,7 @@ export function App() {
             totalFiles={currentSummary.total_files}
             totalBytes={currentSummary.total_bytes}
             options={currentOptions}
+            isRetry={isRetry}
             onFinished={handleCopyFinished}
           />
         )}
@@ -254,28 +251,30 @@ export function App() {
         )}
 
         {activeTab === 'history' && (
-          <HistoryPage
-            pastJobs={pastJobs}
-            onSelectJob={() => {}}
-          />
+          <HistoryPage />
         )}
 
         {activeTab === 'settings' && (
-          <SettingsPage theme={theme} onToggleTheme={toggleTheme} />
+          <SettingsPage
+            theme={theme}
+            onToggleTheme={toggleTheme}
+            options={currentOptions}
+            onOptionsChange={handleOptionsChange}
+          />
         )}
       </main>
 
-      {/* Subtle Status Footer */}
+      {/* Status Footer */}
       <footer className="h-7 border-t border-border px-4 flex items-center justify-between text-[11px] text-text-muted bg-surface select-none shrink-0 font-mono">
         <div className="flex items-center gap-3">
-          <span>Chronicle Offline Engine</span>
+          <span>Chronicle Universal Organizer</span>
           <span>&bull;</span>
           <span>Zero Telemetry</span>
         </div>
         <div className="flex items-center gap-3">
           <span>Non-destructive Copy</span>
           <span>&bull;</span>
-          <span>SHA-256 Verified</span>
+          <span>SHA-256 Physical Verification</span>
         </div>
       </footer>
     </div>

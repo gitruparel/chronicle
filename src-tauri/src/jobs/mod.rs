@@ -1,8 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::{Mutex as TokioMutex, Semaphore};
 use tauri::{AppHandle, Emitter};
 use uuid::Uuid;
 
@@ -18,6 +18,7 @@ pub struct JobManager {
     db: Database,
     cancellation_tokens: Arc<TokioMutex<HashMap<String, Arc<AtomicBool>>>>,
     pause_flags: Arc<TokioMutex<HashMap<String, Arc<AtomicBool>>>>,
+    active_jobs: Arc<TokioMutex<HashSet<String>>>,
 }
 
 impl JobManager {
@@ -26,6 +27,7 @@ impl JobManager {
             db,
             cancellation_tokens: Arc::new(TokioMutex::new(HashMap::new())),
             pause_flags: Arc::new(TokioMutex::new(HashMap::new())),
+            active_jobs: Arc::new(TokioMutex::new(HashSet::new())),
         }
     }
 
@@ -54,7 +56,7 @@ impl JobManager {
     }
 
     /// Scans source directory, extracts metadata via ExifTool batches, resolves dates,
-    /// and plans collision-safe destinations.
+    /// and plans collision-safe destinations. Captures all scan errors without omission.
     pub async fn run_scan_and_plan(
         &self,
         job_id: &str,
@@ -66,17 +68,17 @@ impl JobManager {
         self.db.update_job_status(job_id, JobStatus::Scanning)
             .map_err(|e| e.to_string())?;
 
-        // 1. Recursive scan
-        let scanned_files = scan_directory(source, options.recursive)?;
+        // 1. Recursive scan (captures files AND traversal errors)
+        let scan_result = scan_directory(source, options.recursive)?;
 
         self.db.update_job_status(job_id, JobStatus::Analysing)
             .map_err(|e| e.to_string())?;
 
         // 2. Batched ExifTool extraction
         let batch_size = 50;
-        let mut resolved_files = Vec::with_capacity(scanned_files.len());
+        let mut resolved_files = Vec::with_capacity(scan_result.files.len());
 
-        for chunk in scanned_files.chunks(batch_size) {
+        for chunk in scan_result.files.chunks(batch_size) {
             let paths: Vec<&Path> = chunk.iter().map(|f| f.source_path.as_path()).collect();
             let metadata_map = if exiftool.is_available() {
                 match exiftool.extract_batch(&paths) {
@@ -115,8 +117,8 @@ impl JobManager {
         // 3. Plan destinations and resolve collisions
         let planned_files = plan_destinations(destination, resolved_files);
 
-        // 4. Save to database
-        self.db.save_planned_files(job_id, &planned_files)
+        // 4. Save to database including any traversal/scan errors
+        self.db.save_planned_files(job_id, &planned_files, &scan_result.errors)
             .map_err(|e| format!("Database save error: {}", e))?;
 
         self.db.update_job_status(job_id, JobStatus::Analysed)
@@ -129,13 +131,24 @@ impl JobManager {
         Ok(summary)
     }
 
-    /// Starts streaming copy execution for a job
+    /// Starts streaming copy execution using a bounded worker pool.
+    /// Idempotent: rejects duplicate execution attempts for the same job.
     pub async fn start_execution(
         &self,
         app_handle: AppHandle,
         job_id: String,
         options: JobOptions,
     ) -> Result<(), String> {
+        // Enforce idempotency: prevent starting the same job twice concurrently
+        {
+            let mut active = self.active_jobs.lock().await;
+            if active.contains(&job_id) {
+                log::warn!("Job {} is already running; ignoring duplicate start request.", job_id);
+                return Ok(());
+            }
+            active.insert(job_id.clone());
+        }
+
         let cancel_token = Arc::new(AtomicBool::new(false));
         let pause_flag = Arc::new(AtomicBool::new(false));
 
@@ -146,10 +159,14 @@ impl JobManager {
             pauses.insert(job_id.clone(), pause_flag.clone());
         }
 
+        // Reconcile disk state before resuming/starting
+        let _ = self.db.reconcile_job_with_disk(&job_id);
+
         self.db.update_job_status(&job_id, JobStatus::Running)
             .map_err(|e| e.to_string())?;
 
         let db = self.db.clone();
+        let active_set = self.active_jobs.clone();
         let copy_opts = CopyOptions {
             verify_hash: options.verify_hash,
             buffer_size: 64 * 1024,
@@ -161,105 +178,132 @@ impl JobManager {
         let total_files = files.len() as u64;
         let total_bytes: u64 = files.iter().map(|f| f.size_bytes).sum();
 
+        // Concurrency limiter: bounded worker pool
+        let worker_limit = options.worker_count.clamp(1, 16);
+        let semaphore = Arc::new(Semaphore::new(worker_limit));
+
         tokio::spawn(async move {
-            let mut copied_files: u64 = 0;
-            let mut copied_bytes: u64 = 0;
-            let mut failed_files: u64 = 0;
+            let copied_files = Arc::new(AtomicU64::new(0));
+            let copied_bytes = Arc::new(AtomicU64::new(0));
+            let failed_files = Arc::new(AtomicU64::new(0));
+
+            // Populate already verified files from database
+            for f in &files {
+                if f.status == FileStatus::Verified {
+                    copied_files.fetch_add(1, Ordering::SeqCst);
+                    copied_bytes.fetch_add(f.size_bytes, Ordering::SeqCst);
+                } else if f.status == FileStatus::Failed {
+                    failed_files.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+
+            let mut tasks = Vec::new();
 
             for file in files {
-                // If already verified, count and skip
+                // If file is already verified, skip
                 if file.status == FileStatus::Verified {
-                    copied_files += 1;
-                    copied_bytes += file.size_bytes;
                     continue;
                 }
 
                 // Check cancellation
                 if cancel_token.load(Ordering::SeqCst) {
-                    let _ = db.update_job_status(&job_id, JobStatus::Cancelled);
-                    let _ = app_handle.emit("job-progress", JobProgress {
-                        job_id: job_id.clone(),
-                        status: JobStatus::Cancelled,
-                        total_files,
-                        total_bytes,
-                        copied_files,
-                        copied_bytes,
-                        failed_files,
-                        current_file: None,
-                        current_operation: "Job cancelled".to_string(),
-                        speed_bytes_per_sec: 0,
-                        eta_seconds: None,
-                    });
-                    return;
+                    break;
                 }
 
                 // Check pause
                 while pause_flag.load(Ordering::SeqCst) {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                    tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
                     if cancel_token.load(Ordering::SeqCst) {
-                        let _ = db.update_job_status(&job_id, JobStatus::Cancelled);
+                        break;
+                    }
+                }
+
+                let permit = match semaphore.clone().acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => break,
+                };
+
+                let c_db = db.clone();
+                let c_job_id = job_id.clone();
+                let c_opts = copy_opts.clone();
+                let c_cancel = cancel_token.clone();
+                let c_pause = pause_flag.clone();
+                let c_app = app_handle.clone();
+                let c_copied_f = copied_files.clone();
+                let c_copied_b = copied_bytes.clone();
+                let c_failed_f = failed_files.clone();
+
+                let task = tokio::spawn(async move {
+                    let _permit = permit; // holds permit until task finishes
+
+                    if c_cancel.load(Ordering::SeqCst) {
                         return;
                     }
-                }
 
-                let _ = db.update_file_status(&file.id, FileStatus::Copying, None, None);
+                    let _ = c_db.update_file_status(&file.id, FileStatus::Copying, None, None);
 
-                // Emit progress event
-                let _ = app_handle.emit("job-progress", JobProgress {
-                    job_id: job_id.clone(),
-                    status: JobStatus::Running,
-                    total_files,
-                    total_bytes,
-                    copied_files,
-                    copied_bytes,
-                    failed_files,
-                    current_file: Some(file.filename.clone()),
-                    current_operation: format!("Copying {} to {}", file.filename, file.destination_folder),
-                    speed_bytes_per_sec: 0,
-                    eta_seconds: None,
+                    let _ = c_app.emit("job-progress", JobProgress {
+                        job_id: c_job_id.clone(),
+                        status: JobStatus::Running,
+                        total_files,
+                        total_bytes,
+                        copied_files: c_copied_f.load(Ordering::SeqCst),
+                        copied_bytes: c_copied_b.load(Ordering::SeqCst),
+                        failed_files: c_failed_f.load(Ordering::SeqCst),
+                        current_file: Some(file.filename.clone()),
+                        current_operation: format!("Copying {} to {}", file.filename, file.destination_folder),
+                        speed_bytes_per_sec: 0,
+                        eta_seconds: None,
+                    });
+
+                    let src = file.source_path.clone();
+                    let dst = file.destination_path.clone();
+                    let opts = c_opts.clone();
+                    let c_flag = c_cancel.clone();
+                    let p_flag = c_pause.clone();
+
+                    let res = tokio::task::spawn_blocking(move || {
+                        copy_and_verify_file(&src, &dst, &opts, Some(&c_flag), Some(&p_flag), |_| {})
+                    }).await;
+
+                    match res {
+                        Ok(copy_res) if copy_res.success => {
+                            let _ = c_db.update_file_status(
+                                &file.id,
+                                FileStatus::Verified,
+                                copy_res.sha256.as_deref(),
+                                None,
+                            );
+                            c_copied_f.fetch_add(1, Ordering::SeqCst);
+                            c_copied_b.fetch_add(copy_res.bytes_copied, Ordering::SeqCst);
+                        }
+                        Ok(copy_res) => {
+                            let err_msg = copy_res.error.unwrap_or_else(|| "Copy error".to_string());
+                            let _ = c_db.update_file_status(&file.id, FileStatus::Failed, None, Some(&err_msg));
+                            c_failed_f.fetch_add(1, Ordering::SeqCst);
+                        }
+                        Err(join_err) => {
+                            let err_msg = format!("Task failed: {}", join_err);
+                            let _ = c_db.update_file_status(&file.id, FileStatus::Failed, None, Some(&err_msg));
+                            c_failed_f.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
                 });
 
-                let src = file.source_path.clone();
-                let dst = file.destination_path.clone();
-                let opts = copy_opts.clone();
-                let c_flag = cancel_token.clone();
-
-                // Run copy in blocking thread pool
-                let res = tokio::task::spawn_blocking(move || {
-                    copy_and_verify_file(&src, &dst, &opts, Some(&c_flag), |_| {})
-                }).await;
-
-                match res {
-                    Ok(copy_res) if copy_res.success => {
-                        let _ = db.update_file_status(
-                            &file.id,
-                            FileStatus::Verified,
-                            copy_res.sha256.as_deref(),
-                            None,
-                        );
-                        let _ = db.increment_job_progress(&job_id, copy_res.bytes_copied, true);
-                        copied_files += 1;
-                        copied_bytes += copy_res.bytes_copied;
-                    }
-                    Ok(copy_res) => {
-                        let err_msg = copy_res.error.unwrap_or_else(|| "Unknown copy error".to_string());
-                        let _ = db.update_file_status(&file.id, FileStatus::Failed, None, Some(&err_msg));
-                        let _ = db.increment_job_progress(&job_id, 0, false);
-                        failed_files += 1;
-                    }
-                    Err(join_err) => {
-                        let err_msg = format!("Task execution error: {}", join_err);
-                        let _ = db.update_file_status(&file.id, FileStatus::Failed, None, Some(&err_msg));
-                        let _ = db.increment_job_progress(&job_id, 0, false);
-                        failed_files += 1;
-                    }
-                }
+                tasks.push(task);
             }
 
-            // Terminal status check
+            // Wait for all worker tasks to complete
+            for t in tasks {
+                let _ = t.await;
+            }
+
+            // Terminal status reconciliation
+            let final_failed = failed_files.load(Ordering::SeqCst);
+            let final_copied = copied_files.load(Ordering::SeqCst);
             let final_status = if cancel_token.load(Ordering::SeqCst) {
                 JobStatus::Cancelled
-            } else if failed_files > 0 {
+            } else if final_failed > 0 {
                 JobStatus::Failed
             } else {
                 JobStatus::Completed
@@ -267,14 +311,23 @@ impl JobManager {
 
             let _ = db.update_job_status(&job_id, final_status);
 
+            // Re-sync aggregate counters
+            let _ = db.reconcile_job_with_disk(&job_id);
+
+            // Clear from active set
+            {
+                let mut active = active_set.lock().await;
+                active.remove(&job_id);
+            }
+
             let _ = app_handle.emit("job-progress", JobProgress {
                 job_id: job_id.clone(),
                 status: final_status,
                 total_files,
                 total_bytes,
-                copied_files,
-                copied_bytes,
-                failed_files,
+                copied_files: final_copied,
+                copied_bytes: copied_bytes.load(Ordering::SeqCst),
+                failed_files: final_failed,
                 current_file: None,
                 current_operation: format!("Job finished with status: {:?}", final_status),
                 speed_bytes_per_sec: 0,

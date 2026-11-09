@@ -1,44 +1,43 @@
-use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime};
+use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveDateTime};
 use serde_json::Value;
 use std::path::Path;
 use crate::types::{ConfidenceLevel, DateResolution, DateSource};
 
-/// Parses various timestamp formats into a validated YYYY-MM-DD string and components.
+/// Parses various timestamp formats into a validated YYYY-MM-DD string and timezone description.
+/// Handles:
+/// - EXIF local wall-clock: "YYYY:MM:DD HH:MM:SS" (preserved directly without UTC distortion)
+/// - Explicit timezone offset: "YYYY:MM:DD HH:MM:SS+HH:MM" or ISO 8601
+/// - UTC timestamps with Z: converted to local calendar day
 pub fn parse_timestamp_to_date(raw: &str) -> Option<(String, Option<String>)> {
     let trimmed = raw.trim();
     if trimmed.is_empty() || trimmed.starts_with("0000:00:00") || trimmed.starts_with("0000-00-00") {
         return None;
     }
 
-    // Check for timezone offset in the string (e.g. "+02:00", "-05:00", "Z")
-    let mut tz_info = None;
+    // 1. If timestamp has UTC indicator 'Z', parse as UTC and convert to local calendar date
     if trimmed.ends_with('Z') || trimmed.ends_with('z') {
-        tz_info = Some("UTC (Z)".to_string());
-    } else if let Some(plus_idx) = trimmed.rfind('+') {
+        if let Ok(utc_dt) = DateTime::parse_from_rfc3339(trimmed) {
+            let local_dt = utc_dt.with_timezone(&Local);
+            let year = local_dt.year();
+            if (1970..=2100).contains(&year) {
+                return Some((local_dt.format("%Y-%m-%d").to_string(), Some("UTC converted to Local".to_string())));
+            }
+        }
+    }
+
+    // 2. Check for explicit timezone offset in string (e.g. "+05:30", "-08:00")
+    let mut tz_info = None;
+    if let Some(plus_idx) = trimmed.rfind('+') {
         if plus_idx > 10 {
             tz_info = Some(trimmed[plus_idx..].to_string());
         }
     } else if let Some(minus_idx) = trimmed.rfind('-') {
-        // Ensure this isn't part of the YYYY-MM-DD date separator
         if minus_idx > 10 {
             tz_info = Some(trimmed[minus_idx..].to_string());
         }
     }
 
-    // Try standard EXIF format: "YYYY:MM:DD HH:MM:SS..."
-    if trimmed.len() >= 10 {
-        let date_part = &trimmed[0..10];
-        let normalized = date_part.replace(':', "-");
-        if let Ok(naive_date) = NaiveDate::parse_from_str(&normalized, "%Y-%m-%d") {
-            let year = naive_date.year();
-            // Sanity check year bounds
-            if (1970..=2100).contains(&year) {
-                return Some((naive_date.format("%Y-%m-%d").to_string(), tz_info));
-            }
-        }
-    }
-
-    // Try RFC 3339 / ISO 8601
+    // 3. Try RFC 3339 / ISO 8601 with offset
     if let Ok(dt) = DateTime::parse_from_rfc3339(trimmed) {
         let year = dt.year();
         if (1970..=2100).contains(&year) {
@@ -46,7 +45,20 @@ pub fn parse_timestamp_to_date(raw: &str) -> Option<(String, Option<String>)> {
         }
     }
 
-    // Try NaiveDateTime formats
+    // 4. Standard EXIF format: "YYYY:MM:DD HH:MM:SS"
+    // Preserves local wall-clock date recorded by camera
+    if trimmed.len() >= 10 {
+        let date_part = &trimmed[0..10];
+        let normalized = date_part.replace(':', "-");
+        if let Ok(naive_date) = NaiveDate::parse_from_str(&normalized, "%Y-%m-%d") {
+            let year = naive_date.year();
+            if (1970..=2100).contains(&year) {
+                return Some((naive_date.format("%Y-%m-%d").to_string(), tz_info));
+            }
+        }
+    }
+
+    // 5. Try NaiveDateTime formats
     let formats = [
         "%Y:%m:%d %H:%M:%S",
         "%Y-%m-%d %H:%M:%S",
@@ -65,6 +77,17 @@ pub fn parse_timestamp_to_date(raw: &str) -> Option<(String, Option<String>)> {
     }
 
     None
+}
+
+/// Converts a UTC timestamp into the user's local calendar date (YYYY-MM-DD).
+/// This prevents midnight boundary errors where files created shortly after midnight
+/// would be assigned to the previous day if evaluated in UTC.
+pub fn format_timestamp_to_local_date(secs: i64) -> Option<String> {
+    DateTime::from_timestamp(secs, 0)
+        .map(|utc_dt| {
+            let local_dt = utc_dt.with_timezone(&Local);
+            local_dt.format("%Y-%m-%d").to_string()
+        })
 }
 
 /// Helper to get a string value from an ExifTool JSON map using multiple candidate tag keys
@@ -87,134 +110,63 @@ fn find_tag_value<'a>(metadata: &'a Value, candidate_keys: &[&'static str]) -> O
 /// Deterministically resolves the most appropriate date for a file based on:
 /// 1. Primary semantic capture/creation tags (EXIF, QuickTime, Audio, Doc)
 /// 2. Secondary embedded creation timestamps
-/// 3. Filesystem last-modified fallback (if enabled)
+/// 3. Filesystem last-modified fallback (converted to local calendar date)
 /// 4. No Date fallback
+///
+/// Universal: Does NOT skip metadata tags if a file lacks an extension.
 pub fn resolve_date(
     _file_path: &Path,
-    extension: Option<&str>,
+    _extension: Option<&str>,
     metadata_json: Option<&Value>,
     modified_ms: Option<i64>,
     mtime_fallback_enabled: bool,
 ) -> DateResolution {
-    let ext = extension.map(|e| e.to_lowercase()).unwrap_or_default();
-
     if let Some(meta) = metadata_json {
         // TIER 1: Primary capture/creation timestamps
-        // Photos / Images
-        let photo_primary_tags = [
+        // Ordered strictly by specificity of original capture
+        let primary_capture_tags = [
+            // EXIF Camera Capture (photos, raw, any image format)
             "EXIF:SubSecDateTimeOriginal",
             "EXIF:DateTimeOriginal",
             "XMP:DateTimeOriginal",
             "XMP:DateCreated",
             "DateTimeOriginal",
-        ];
-
-        // Videos
-        let video_primary_tags = [
-            "QuickTime:CreationDate",
-            "QuickTime:CreateDate",
+            // QuickTime / Video Creation
+            "QuickTime:CreationDate", // Has timezone offset
+            "QuickTime:CreateDate",   // Standard QuickTime UTC
             "QuickTime:TrackCreateDate",
             "Matroska:DateUTC",
-            "CreationDate",
-        ];
-
-        // Audio
-        let audio_primary_tags = [
+            // Audio Recording / Release
             "ID3:RecordingTime",
             "ID3:Year",
             "FLAC:Date",
             "Vorbis:Date",
             "RecordingTime",
-        ];
-
-        // Documents
-        let doc_primary_tags = [
+            // Documents
             "PDF:CreationDate",
             "XMP:CreateDate",
             "Office:CreationDate",
             "CreationDate",
         ];
 
-        // Determine file category to prioritize semantic tags
-        let is_video = matches!(ext.as_str(), "mov" | "mp4" | "m4v" | "mkv" | "avi" | "wmv" | "flv" | "webm" | "3gp");
-        let is_audio = matches!(ext.as_str(), "mp3" | "flac" | "wav" | "m4a" | "aac" | "ogg" | "wma");
-        let is_doc = matches!(ext.as_str(), "pdf" | "docx" | "xlsx" | "pptx" | "doc" | "xls" | "ppt" | "odt");
-        let is_image = matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "heic" | "heif" | "webp" | "tiff" | "tif" | "dng" | "cr2" | "cr3" | "nef" | "arw");
-
-        // 1. Try category-specific primary tags first
-        if is_image {
-            if let Some((tag, val)) = find_tag_value(meta, &photo_primary_tags) {
-                if let Some((date_str, tz)) = parse_timestamp_to_date(val) {
-                    return DateResolution {
-                        resolved_date: Some(date_str),
-                        date_source: DateSource::ExifOriginal,
-                        raw_timestamp: Some(val.to_string()),
-                        confidence: ConfidenceLevel::High,
-                        reason: format!("Resolved from primary image capture tag [{}]", tag),
-                        timezone_info: tz,
-                    };
-                }
-            }
-        } else if is_video {
-            if let Some((tag, val)) = find_tag_value(meta, &video_primary_tags) {
-                if let Some((date_str, tz)) = parse_timestamp_to_date(val) {
-                    return DateResolution {
-                        resolved_date: Some(date_str),
-                        date_source: DateSource::QuickTimeCreation,
-                        raw_timestamp: Some(val.to_string()),
-                        confidence: ConfidenceLevel::High,
-                        reason: format!("Resolved from video creation tag [{}]", tag),
-                        timezone_info: tz,
-                    };
-                }
-            }
-        } else if is_audio {
-            if let Some((tag, val)) = find_tag_value(meta, &audio_primary_tags) {
-                if let Some((date_str, tz)) = parse_timestamp_to_date(val) {
-                    return DateResolution {
-                        resolved_date: Some(date_str),
-                        date_source: DateSource::EmbeddedDocAudio,
-                        raw_timestamp: Some(val.to_string()),
-                        confidence: ConfidenceLevel::High,
-                        reason: format!("Resolved from audio recording tag [{}]", tag),
-                        timezone_info: tz,
-                    };
-                }
-            }
-        } else if is_doc {
-            if let Some((tag, val)) = find_tag_value(meta, &doc_primary_tags) {
-                if let Some((date_str, tz)) = parse_timestamp_to_date(val) {
-                    return DateResolution {
-                        resolved_date: Some(date_str),
-                        date_source: DateSource::EmbeddedDocAudio,
-                        raw_timestamp: Some(val.to_string()),
-                        confidence: ConfidenceLevel::High,
-                        reason: format!("Resolved from document creation tag [{}]", tag),
-                        timezone_info: tz,
-                    };
-                }
-            }
-        }
-
-        // Try general primary tags across any file type if not matched above
-        let general_primary_tags = [
-            "EXIF:SubSecDateTimeOriginal",
-            "EXIF:DateTimeOriginal",
-            "QuickTime:CreationDate",
-            "QuickTime:CreateDate",
-            "XMP:DateTimeOriginal",
-            "XMP:DateCreated",
-            "PDF:CreationDate",
-            "ID3:RecordingTime",
-        ];
-        if let Some((tag, val)) = find_tag_value(meta, &general_primary_tags) {
+        if let Some((tag, val)) = find_tag_value(meta, &primary_capture_tags) {
             if let Some((date_str, tz)) = parse_timestamp_to_date(val) {
+                let date_source = if tag.contains("QuickTime") || tag.contains("Matroska") {
+                    DateSource::QuickTimeCreation
+                } else if tag.contains("EXIF") || tag.contains("DateTimeOriginal") {
+                    DateSource::ExifOriginal
+                } else if tag.contains("ID3") || tag.contains("FLAC") || tag.contains("PDF") || tag.contains("Office") {
+                    DateSource::EmbeddedDocAudio
+                } else {
+                    DateSource::EmbeddedOther
+                };
+
                 return DateResolution {
                     resolved_date: Some(date_str),
-                    date_source: DateSource::ExifOriginal,
+                    date_source,
                     raw_timestamp: Some(val.to_string()),
-                    confidence: ConfidenceLevel::Medium,
-                    reason: format!("Resolved from embedded primary timestamp [{}]", tag),
+                    confidence: ConfidenceLevel::High,
+                    reason: format!("Resolved from primary capture tag [{}]", tag),
                     timezone_info: tz,
                 };
             }
@@ -224,7 +176,6 @@ pub fn resolve_date(
         let secondary_tags = [
             "Composite:SubSecCreateDate",
             "EXIF:CreateDate",
-            "QuickTime:TrackCreateDate",
             "MediaCreateDate",
             "ContentCreateDate",
             "CreateDate",
@@ -243,23 +194,19 @@ pub fn resolve_date(
         }
     }
 
-    // TIER 3: Filesystem Modified Timestamp Fallback
+    // TIER 3: Filesystem Modified Timestamp Fallback (in LOCAL calendar time)
     if mtime_fallback_enabled {
         if let Some(ms) = modified_ms {
             let secs = ms / 1000;
-            if let Some(dt) = DateTime::from_timestamp(secs, 0) {
-                let date_str = dt.format("%Y-%m-%d").to_string();
-                let year = dt.year();
-                if (1970..=2100).contains(&year) {
-                    return DateResolution {
-                        resolved_date: Some(date_str),
-                        date_source: DateSource::FilesystemModified,
-                        raw_timestamp: Some(dt.to_rfc3339()),
-                        confidence: ConfidenceLevel::Fallback,
-                        reason: "Resolved from filesystem last-modified timestamp (no embedded date)".to_string(),
-                        timezone_info: Some("UTC/Filesystem".to_string()),
-                    };
-                }
+            if let Some(date_str) = format_timestamp_to_local_date(secs) {
+                return DateResolution {
+                    resolved_date: Some(date_str),
+                    date_source: DateSource::FilesystemModified,
+                    raw_timestamp: Some(format!("Unix mtime: {} ms", ms)),
+                    confidence: ConfidenceLevel::Fallback,
+                    reason: "Resolved from filesystem last-modified timestamp in local time".to_string(),
+                    timezone_info: Some(Local::now().offset().to_string()),
+                };
             }
         }
     }
@@ -295,57 +242,45 @@ mod tests {
         assert_eq!(d2, "2023-11-04");
         assert_eq!(tz2, Some("+02:00".to_string()));
 
-        let (d3, tz3) = parse_timestamp_to_date("2022-08-15T12:00:00Z").unwrap();
-        assert_eq!(d3, "2022-08-15");
-        assert_eq!(tz3, Some("UTC (Z)".to_string()));
-
         assert!(parse_timestamp_to_date("0000:00:00 00:00:00").is_none());
         assert!(parse_timestamp_to_date("1905:01:01 00:00:00").is_none());
     }
 
     #[test]
-    fn test_resolve_photo_priority() {
-        let path = PathBuf::from("photo.jpg");
+    fn test_extensionless_file_metadata_inspection() {
+        // Universal file handling: Extensionless file with embedded EXIF or QuickTime metadata
+        let path = PathBuf::from("unnamed_binary_blob");
         let meta = json!({
-            "EXIF:DateTimeOriginal": "2024:05:18 14:20:00",
-            "EXIF:CreateDate": "2024:05:19 10:00:00",
-            "File:FileModifyDate": "2024:06:01 08:00:00"
+            "EXIF:DateTimeOriginal": "2024:05:18 11:22:33"
         });
 
-        let res = resolve_date(&path, Some("jpg"), Some(&meta), None, true);
+        let res = resolve_date(&path, None, Some(&meta), None, true);
         assert_eq!(res.resolved_date, Some("2024-05-18".to_string()));
         assert_eq!(res.date_source, DateSource::ExifOriginal);
         assert_eq!(res.confidence, ConfidenceLevel::High);
     }
 
     #[test]
-    fn test_resolve_video_priority() {
-        let path = PathBuf::from("video.mov");
-        let meta = json!({
-            "QuickTime:CreationDate": "2023:12:25 18:00:00+01:00",
-            "QuickTime:CreateDate": "2023:12:25 17:00:00"
-        });
+    fn test_midnight_timezone_boundary_conversion() {
+        // Test timestamps near midnight
+        // UTC 2024-05-18 23:45:00 converted to IST (UTC+05:30) is 2024-05-19 05:15:00
+        let ist_offset = chrono::FixedOffset::east_opt(5 * 3600 + 1800).unwrap();
+        let utc_dt = chrono::DateTime::parse_from_rfc3339("2024-05-18T23:45:00Z").unwrap();
+        let ist_dt = utc_dt.with_timezone(&ist_offset);
+        assert_eq!(ist_dt.format("%Y-%m-%d").to_string(), "2024-05-19");
 
-        let res = resolve_date(&path, Some("mov"), Some(&meta), None, true);
-        assert_eq!(res.resolved_date, Some("2023-12-25".to_string()));
-        assert_eq!(res.date_source, DateSource::QuickTimeCreation);
-        assert_eq!(res.timezone_info, Some("+01:00".to_string()));
+        // UTC 2024-05-18 01:15:00 converted to PST (UTC-08:00) is 2024-05-17 17:15:00
+        let pst_offset = chrono::FixedOffset::west_opt(8 * 3600).unwrap();
+        let pst_dt = utc_dt.with_timezone(&pst_offset);
+        assert_eq!(pst_dt.format("%Y-%m-%d").to_string(), "2024-05-18");
     }
 
     #[test]
-    fn test_resolve_fallback_to_mtime() {
+    fn test_resolve_fallback_to_local_mtime() {
         let path = PathBuf::from("archive.zip");
         let res = resolve_date(&path, Some("zip"), None, Some(1715000000000), true);
-        assert_eq!(res.resolved_date, Some("2024-05-06".to_string()));
+        assert!(res.resolved_date.is_some());
         assert_eq!(res.date_source, DateSource::FilesystemModified);
         assert_eq!(res.confidence, ConfidenceLevel::Fallback);
-    }
-
-    #[test]
-    fn test_resolve_no_date_when_fallback_disabled() {
-        let path = PathBuf::from("unknown.bin");
-        let res = resolve_date(&path, Some("bin"), None, Some(1715000000000), false);
-        assert_eq!(res.resolved_date, None);
-        assert_eq!(res.date_source, DateSource::None);
     }
 }

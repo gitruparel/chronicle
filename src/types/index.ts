@@ -74,6 +74,7 @@ export interface JobSummary {
   metadata_error_count: number;
   duplicate_content_count: number;
   unique_folders_count: number;
+  scan_error_count: number;
 }
 
 export interface JobProgress {
@@ -88,6 +89,21 @@ export interface JobProgress {
   current_operation: string;
   speed_bytes_per_sec: number;
   eta_seconds: number | null;
+}
+
+export interface JobRecord {
+  id: string;
+  name: string;
+  source_path: string;
+  destination_path: string;
+  status: JobStatus;
+  total_files: number;
+  total_bytes: number;
+  copied_files: number;
+  copied_bytes: number;
+  failed_files: number;
+  created_at: number;
+  completed_at: number | null;
 }
 
 export interface PathValidationResult {

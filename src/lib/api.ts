@@ -6,6 +6,7 @@ import type {
   CreateJobResponse,
   JobOptions,
   JobProgress,
+  JobRecord,
   JobSummary,
   OverlapCheckResult,
   PaginatedFilesResponse,
@@ -69,6 +70,10 @@ export const api = {
     return invoke<JobSummary>('get_job_summary_cmd', { jobId });
   },
 
+  async getAllJobs(): Promise<JobRecord[]> {
+    return invoke<JobRecord[]>('get_all_jobs_cmd');
+  },
+
   async startCopy(jobId: string, options: JobOptions): Promise<void> {
     return invoke<void>('start_copy_job', { jobId, options });
   },
@@ -85,8 +90,8 @@ export const api = {
     return invoke<boolean>('cancel_copy_job', { jobId });
   },
 
-  async retryFailed(jobId: string): Promise<number> {
-    return invoke<number>('retry_failed_job', { jobId });
+  async retryFailed(jobId: string, options: JobOptions): Promise<number> {
+    return invoke<number>('retry_failed_job', { jobId, options });
   },
 
   async exportReport(jobId: string, format: 'csv' | 'json', outputPath: string): Promise<void> {

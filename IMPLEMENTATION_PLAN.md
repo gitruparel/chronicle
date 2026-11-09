@@ -82,3 +82,13 @@
 - [x] 8.3 ExifTool bundling and license notices verification.
 - [x] 8.4 Verification of production build (`npm run build`, `cargo test`, `cargo build`).
 - [x] 8.5 Verification of offline-first operation and privacy guarantees.
+
+## Phase 9: Architecture Audit & Critical Findings Hardening
+- [x] 9.1 **Zero Silent Drops (Finding 1)**: `scan_directory` returns `ScanResult { files, errors }`. Traversal and permission errors are captured as `ScanErrorItem`, persisted to SQLite `job_files` as `status: failed`, and accounted for in job completion reporting.
+- [x] 9.2 **Independent Destination Verification (Finding 2)**: Copy engine performs physical `sync_all()`, independently reads destination file from disk, verifies `src_hash == dst_hash`, and commits via non-overwriting atomic check.
+- [x] 9.3 **Local Calendar Day Timezone Resolution (Finding 3)**: Filesystem modification epoch times and QuickTime UTC timestamps convert to local calendar day via `chrono::Local` (preventing incorrect date assignment around midnight). Extensionless files inspected for metadata.
+- [x] 9.4 **Disk-Reconciled Crash Recovery (Finding 4)**: On startup and after execution, `reconcile_job_with_disk` validates physical destination existence, size, and SHA-256 hash before trusting verified records, safely recovering orphaned temporary files.
+- [x] 9.5 **Persistent Job History (Finding 5)**: SQLite-backed history table with `get_all_jobs_cmd` replacing temporary React component state.
+- [x] 9.6 **Bounded Worker Concurrency (Finding 6)**: Copy loop utilizes `tokio::sync::Semaphore` dynamically bounded by user-configured `worker_count`.
+- [x] 9.7 **Mid-Stream Pause Checking (Finding 7)**: Copy streaming loop cooperatively pauses during chunk transfer via atomic pause flag.
+- [x] 9.8 **End-to-End Retry Workflow (Finding 8)**: Re-triggers execution for failed files and updates database state.

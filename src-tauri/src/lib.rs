@@ -60,6 +60,7 @@ pub fn run() {
             commands::create_and_scan_job,
             commands::get_preview_files,
             commands::get_job_summary_cmd,
+            commands::get_all_jobs_cmd,
             commands::start_copy_job,
             commands::pause_copy_job,
             commands::resume_copy_job,

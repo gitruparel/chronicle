@@ -44,7 +44,9 @@ Chronicle is an offline-first Windows desktop application built with **Tauri 2**
 ## 2. Core Subsystems
 
 ### 2.1 Scanner Engine (`src-tauri/src/scanner/`)
-- **Universal Traversal**: Enumerates all directory entries using `walkdir` or native directory iteration.
+- **Universal Traversal**: Enumerates all directory entries recursively using `walkdir`.
+- **Zero Silent Drops**: Unreadable directory entries and files whose filesystem metadata cannot be read are never omitted. Traversal errors are captured as `ScanErrorItem` and returned in `ScanResult { files, errors }`. The job coordinator persists them into SQLite `job_files` with `status: 'failed'` and destination `"Scan Errors"`, satisfying the accountability formula:
+  $$\text{Discovered} = \text{Verified} + \text{Failed} + \text{Cancelled} + \text{Excluded}$$
 - **Safety Checks**:
   - Validates that source path exists and is a directory.
   - Validates destination path. Rejects if `source == destination` or if `destination` is nested inside `source`.
@@ -61,17 +63,19 @@ Resolves a deterministic calendar date (`YYYY-MM-DD`) and timestamp for each fil
    - Videos: `QuickTime:CreateDate`, `QuickTime:CreationDate`, `QuickTime:TrackCreateDate` (with timezone offset normalization).
    - Audio: `ID3:RecordingTime`, `ID3:Year`, `FLAC:Date`, `Vorbis:Date`.
    - Documents: `PDF:CreationDate`, `XMP:CreateDate`, `Office:CreationDate`.
+   - Extensionless files are inspected without extension filtering.
 2. **Semantic Secondary Embedded Metadata**:
    - `MediaCreateDate`, `ContentCreateDate`, `HistoryWhen`.
    - Explicitly rejects `ModifyDate` or generic file tags when seeking primary capture, unless configured.
 3. **Filesystem Last-Modified Timestamp (Fallback)**:
    - Used when enabled in job settings if embedded metadata is absent, unreadable, or invalid.
+   - Evaluated in the user's local timezone (`chrono::Local`) rather than naive UTC, preventing date shifts near midnight (e.g. UTC+05:30 IST).
 4. **No Date**:
    - Files with missing metadata and disabled/absent modified dates are routed to the `No Date/` folder.
 
 #### Timezone & Normalization Rules:
 - EXIF dates lacking timezone offsets are preserved in local wall-clock time as recorded by the capturing device (no arbitrary UTC shifts).
-- QuickTime tags stored in UTC are converted to local time or preserved deterministically based on available creation tags.
+- QuickTime tags stored in UTC ('Z') are explicitly converted to local calendar dates matching Windows Explorer expectations.
 - Result payload captures: `resolved_date` (`YYYY-MM-DD`), `date_source` (e.g. `Exif:DateTimeOriginal`, `Filesystem:Modified`, `None`), `raw_timestamp`, `confidence_level`, and `rationale`.
 
 ### 2.3 Collision & Destination Planner (`src-tauri/src/organizer/`)
@@ -84,12 +88,14 @@ Resolves a deterministic calendar date (`YYYY-MM-DD`) and timestamp for each fil
   - Identical content (matching SHA-256) is **never** skipped. Both copies are preserved with distinct suffixed names.
 
 ### 2.4 Copy Engine (`src-tauri/src/copy_engine/`)
-- **Zero In-Memory Buffering**: Streams files in 64 KB or 1 MB chunks via `tokio::io::AsyncReadExt` and `tokio::io::AsyncWriteExt`.
-- **Two-Phase Commit**:
-  1. Copies source bytes into a temporary destination file: `.chronicle_tmp_<uuid>_<filename>`.
-  2. Computes source SHA-256 and destination SHA-256 simultaneously during streaming (or verifies destination hash against computed source hash).
-  3. Verifies file size matches exactly.
-  4. Atomically renames temporary file to final target name via `std::fs::rename` (or Windows `MoveFileExW` with `MOVEFILE_WRITE_THROUGH`).
+- **Zero In-Memory Buffering**: Streams files in 64 KB chunks via buffered reads and writes.
+- **Two-Phase Commit & Independent Physical Verification**:
+  1. Stream copy into temporary destination file: `.chronicle_tmp_<uuid>_<filename>`.
+  2. Incremental SHA-256 calculation on source stream.
+  3. Mid-stream cooperative pause (`pause_flag`) and cancellation checks.
+  4. Physical disk flush via `dst_file.sync_all()` to guarantee physical storage persistence before validation.
+  5. **Independent Destination Hash Verification**: Re-opens temporary destination file from disk, computes SHA-256 independently, and verifies `src_hash == dst_hash`.
+  6. Non-overwriting atomic commit via `commit_non_overwriting` to guarantee existing files are never overwritten even during race conditions.
 - **Cancellation & Cleanup**:
   - Incomplete `.chronicle_tmp_*` files are deleted immediately if copy fails or user cancels.
 - **Source Verification**:
@@ -99,12 +105,12 @@ Resolves a deterministic calendar date (`YYYY-MM-DD`) and timestamp for each fil
 - SQLite database stored at `%APPDATA%/Chronicle/chronicle.db` (or application data directory).
 - Uses WAL (Write-Ahead Logging) mode and busy timeout for concurrent safety.
 - **Schema**:
-  - `jobs`: Job ID, source path, destination path, options JSON, status (`discovered`, `analysed`, `running`, `paused`, `completed`, `cancelled`, `failed`), timestamps, metrics.
-  - `job_files`: File ID, job ID, source path, relative path, file size, source mtime, status (`discovered`, `analysed`, `pending`, `copying`, `verified`, `failed`, `skipped`), resolved date, date source, planned filename, destination path, sha256, error message, attempt count.
+  - `jobs`: Job ID, source path, destination path, options JSON, status (`discovered`, `analysed`, `running`, `paused`, `completed`, `cancelled`, `failed`), timestamps, metrics, error count.
+  - `job_files`: File ID, job ID, source path, relative path, file size, source mtime, status (`discovered`, `analysed`, `pending`, `copying`, `verified`, `failed`, `cancelled`), resolved date, date source, planned filename, destination path, sha256, error message, attempt count.
 - **Crash Recovery & Reconciliation**:
-  - On restart, uncompleted jobs are scanned.
-  - Any file marked `verified` must have its destination file verified on disk (existence + size).
-  - Unfinished files in `copying` state are reset to `pending` after removing lingering `.chronicle_tmp_*` files.
+  - On restart and after execution, `reconcile_job_with_disk` physically checks destination existence, size, and SHA-256 hash.
+  - Uncompleted files in `copying` state are reset to `pending` after removing lingering `.chronicle_tmp_*` files.
+  - Fully persistent history across application restarts via `get_all_jobs`.
 
 ---
 

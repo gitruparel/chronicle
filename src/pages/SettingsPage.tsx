@@ -9,18 +9,17 @@ import {
   FileText,
 } from 'lucide-react';
 import { api } from '../lib/api';
-import type { AppInfoResponse } from '../types';
+import type { AppInfoResponse, JobOptions } from '../types';
 
 interface SettingsPageProps {
   theme: 'dark' | 'light';
   onToggleTheme: () => void;
+  options: JobOptions;
+  onOptionsChange: (newOptions: JobOptions) => void;
 }
 
-export function SettingsPage({ theme, onToggleTheme }: SettingsPageProps) {
+export function SettingsPage({ theme, onToggleTheme, options, onOptionsChange }: SettingsPageProps) {
   const [appInfo, setAppInfo] = useState<AppInfoResponse | null>(null);
-  const [workers, setWorkers] = useState(4);
-  const [verifyByDefault, setVerifyByDefault] = useState(true);
-  const [mtimeFallback, setMtimeFallback] = useState(true);
 
   useEffect(() => {
     api.getAppInfo().then(setAppInfo).catch(console.error);
@@ -48,7 +47,7 @@ export function SettingsPage({ theme, onToggleTheme }: SettingsPageProps) {
             <div className="space-y-0.5">
               <span className="text-xs font-medium text-text-primary">Worker Thread Pool</span>
               <p className="text-[11px] text-text-muted">
-                Number of concurrent copy streams. (Default: 4. Range: 1 to 16)
+                Number of concurrent copy streams in the bounded worker pool. (Default: 4. Range: 1 to 16)
               </p>
             </div>
             <div className="flex items-center gap-3">
@@ -56,12 +55,12 @@ export function SettingsPage({ theme, onToggleTheme }: SettingsPageProps) {
                 type="range"
                 min="1"
                 max="16"
-                value={workers}
-                onChange={(e) => setWorkers(parseInt(e.target.value))}
+                value={options.worker_count}
+                onChange={(e) => onOptionsChange({ ...options, worker_count: parseInt(e.target.value) })}
                 className="w-32 accent-accent cursor-pointer"
               />
               <span className="text-xs font-mono font-semibold text-accent w-6 text-right">
-                {workers}
+                {options.worker_count}
               </span>
             </div>
           </div>
@@ -70,13 +69,13 @@ export function SettingsPage({ theme, onToggleTheme }: SettingsPageProps) {
             <div className="space-y-0.5">
               <span className="text-xs font-medium text-text-primary">SHA-256 Checksum Verification</span>
               <p className="text-[11px] text-text-muted">
-                Compute and verify cryptographic hash on-the-fly during every copy stream.
+                Compute and independently verify destination cryptographic hash on-the-fly during every copy stream.
               </p>
             </div>
             <input
               type="checkbox"
-              checked={verifyByDefault}
-              onChange={(e) => setVerifyByDefault(e.target.checked)}
+              checked={options.verify_hash}
+              onChange={(e) => onOptionsChange({ ...options, verify_hash: e.target.checked })}
               className="rounded border-border bg-background text-accent focus:ring-accent"
             />
           </div>
@@ -85,13 +84,13 @@ export function SettingsPage({ theme, onToggleTheme }: SettingsPageProps) {
             <div className="space-y-0.5">
               <span className="text-xs font-medium text-text-primary">Filesystem Modified Date Fallback</span>
               <p className="text-[11px] text-text-muted">
-                Fallback to filesystem mtime when embedded metadata is missing or unsupported.
+                Fallback to filesystem mtime in local wall-clock time when embedded metadata is missing.
               </p>
             </div>
             <input
               type="checkbox"
-              checked={mtimeFallback}
-              onChange={(e) => setMtimeFallback(e.target.checked)}
+              checked={options.mtime_fallback}
+              onChange={(e) => onOptionsChange({ ...options, mtime_fallback: e.target.checked })}
               className="rounded border-border bg-background text-accent focus:ring-accent"
             />
           </div>
@@ -139,7 +138,7 @@ export function SettingsPage({ theme, onToggleTheme }: SettingsPageProps) {
               ) : (
                 <>
                   <AlertCircle className="h-4 w-4 text-amber-400" />
-                  <span>ExifTool Unavailable (Using mtime)</span>
+                  <span>ExifTool Unavailable (Using mtime fallback)</span>
                 </>
               )}
             </div>

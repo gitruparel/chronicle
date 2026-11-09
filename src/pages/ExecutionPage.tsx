@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import {
   Loader2,
   CheckCircle2,
@@ -20,6 +20,7 @@ interface ExecutionPageProps {
   totalFiles: number;
   totalBytes: number;
   options: JobOptions;
+  isRetry?: boolean;
   onFinished: (status: JobStatus) => void;
 }
 
@@ -28,6 +29,7 @@ export function ExecutionPage({
   totalFiles,
   totalBytes,
   options,
+  isRetry = false,
   onFinished,
 }: ExecutionPageProps) {
   const [progress, setProgress] = useState<JobProgress>({
@@ -46,6 +48,7 @@ export function ExecutionPage({
 
   const [isPaused, setIsPaused] = useState(false);
   const [logs, setLogs] = useState<string[]>([]);
+  const hasStartedRef = useRef(false);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -68,11 +71,18 @@ export function ExecutionPage({
         }
       });
 
-      // Start the copy engine
-      try {
-        await api.startCopy(jobId, options);
-      } catch (err) {
-        console.error('Failed to trigger copy job:', err);
+      // Start the copy engine exactly once per mount
+      if (!hasStartedRef.current) {
+        hasStartedRef.current = true;
+        try {
+          if (isRetry) {
+            await api.retryFailed(jobId, options);
+          } else {
+            await api.startCopy(jobId, options);
+          }
+        } catch (err) {
+          console.error('Failed to trigger copy job:', err);
+        }
       }
     };
 
@@ -81,7 +91,7 @@ export function ExecutionPage({
     return () => {
       if (unlisten) unlisten();
     };
-  }, [jobId, options, onFinished]);
+  }, [jobId, options, isRetry, onFinished]);
 
   const handlePause = async () => {
     try {
@@ -125,10 +135,10 @@ export function ExecutionPage({
           </div>
           <div>
             <h2 className="text-base font-semibold text-text-primary tracking-tight">
-              {isPaused ? 'Copy Paused' : 'Organizing and Copying Files...'}
+              {isPaused ? 'Copy Paused' : isRetry ? 'Retrying Failed Files...' : 'Organizing and Copying Files...'}
             </h2>
             <p className="text-xs text-text-secondary">
-              Streaming chunks to destination with SHA-256 validation.
+              Bounded concurrent streams with SHA-256 verification and physical disk commit.
             </p>
           </div>
         </div>
