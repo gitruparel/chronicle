@@ -156,6 +156,7 @@ pub fn resolve_date(
         // Ordered strictly by specificity of original capture
         let primary_capture_tags = [
             // EXIF Camera Capture (photos, raw, any image format)
+            "Composite:SubSecDateTimeOriginal",
             "EXIF:SubSecDateTimeOriginal",
             "EXIF:DateTimeOriginal",
             "XMP:DateTimeOriginal",
@@ -165,6 +166,8 @@ pub fn resolve_date(
             "QuickTime:CreationDate", // Has timezone offset
             "QuickTime:CreateDate",   // Standard QuickTime UTC
             "QuickTime:TrackCreateDate",
+            "QuickTime:MediaCreateDate",
+            "QuickTime:EncodingTime",
             "Matroska:DateUTC",
             // Audio Recording / Release
             "ID3:RecordingTime",
@@ -172,7 +175,8 @@ pub fn resolve_date(
             "FLAC:Date",
             "Vorbis:Date",
             "RecordingTime",
-            // Documents
+            // Documents & PNG
+            "PNG:CreationTime",
             "PDF:CreationDate",
             "XMP:CreateDate",
             "Office:CreationDate",
@@ -180,7 +184,7 @@ pub fn resolve_date(
         ];
 
         if let Some((tag, val)) = find_tag_value(meta, &primary_capture_tags) {
-            let is_utc_container_tag = tag == "QuickTime:CreateDate" || tag == "QuickTime:TrackCreateDate" || tag == "Matroska:DateUTC";
+            let is_utc_container_tag = tag == "QuickTime:CreateDate" || tag == "QuickTime:TrackCreateDate" || tag == "QuickTime:MediaCreateDate" || tag == "Matroska:DateUTC";
             let parsed_opt = if is_utc_container_tag && !val.contains('+') && !val.contains('-') && !val.ends_with('Z') && !val.ends_with('z') {
                 // Container stores naive timestamps in UTC by spec -> convert to Local
                 parse_quicktime_utc_timestamp(val).or_else(|| parse_timestamp_to_date(val))

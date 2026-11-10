@@ -443,3 +443,72 @@ fn test_large_synthetic_dataset_10000_files() {
     // Verify all 10,000 files were planned deterministically
     assert!(plan_duration.as_secs() < 10, "Planning 10,000 files must complete within 10 seconds");
 }
+
+#[test]
+fn test_path_normalization_for_exiftool_matching() {
+    use chronicle_lib::jobs::normalize_path_key;
+
+    // Standard Windows backslashes vs ExifTool forward slashes
+    let win_path = r"C:\Users\Swayam\Pictures\Camera Roll\WIN_20250328_09_04_36_Pro.jpg";
+    let exiftool_src = "C:/Users/Swayam/Pictures/Camera Roll/WIN_20250328_09_04_36_Pro.jpg";
+    assert_eq!(normalize_path_key(win_path), normalize_path_key(exiftool_src));
+
+    // Extended length prefix \\?\
+    let unc_prefix_path = r"\\?\C:\Users\Swayam\Pictures\Camera Roll\WIN_20250328_09_04_36_Pro.jpg";
+    assert_eq!(normalize_path_key(unc_prefix_path), normalize_path_key(exiftool_src));
+
+    // Case insensitivity
+    let mixed_case = "c:/users/swayam/pictures/camera roll/win_20250328_09_04_36_pro.jpg";
+    assert_eq!(normalize_path_key(win_path), normalize_path_key(mixed_case));
+}
+
+#[test]
+fn test_real_image_and_video_metadata_resolution() {
+    use chronicle_lib::metadata::ExifToolManager;
+
+    let manager = ExifToolManager::new();
+    if !manager.is_available() {
+        println!("ExifTool binary not available in test environment, skipping real file test");
+        return;
+    }
+
+    // Test real camera roll photo if present on host machine
+    let real_photo = PathBuf::from(r"C:\Users\Swayam\Pictures\Camera Roll\WIN_20250328_09_04_36_Pro.jpg");
+    if real_photo.exists() {
+        let batch = manager.extract_batch(&[real_photo.as_path()]);
+        if let Ok(items) = batch {
+            if let Some(item) = items.first() {
+                let date_res = resolve_date(
+                    &real_photo,
+                    Some("jpg"),
+                    Some(item),
+                    None,
+                    true,
+                );
+                assert_eq!(date_res.resolved_date, Some("2025-03-28".to_string()));
+                assert_eq!(date_res.date_source, DateSource::ExifOriginal);
+                assert_eq!(date_res.confidence, ConfidenceLevel::High);
+            }
+        }
+    }
+
+    // Test real camera roll MP4 video if present on host machine
+    let real_video = PathBuf::from(r"C:\Users\Swayam\Pictures\Camera Roll\WIN_20220202_12_07_04_Pro.mp4");
+    if real_video.exists() {
+        let batch = manager.extract_batch(&[real_video.as_path()]);
+        if let Ok(items) = batch {
+            if let Some(item) = items.first() {
+                let date_res = resolve_date(
+                    &real_video,
+                    Some("mp4"),
+                    Some(item),
+                    None,
+                    true,
+                );
+                assert_eq!(date_res.resolved_date, Some("2022-02-02".to_string()));
+                assert_eq!(date_res.date_source, DateSource::QuickTimeCreation);
+                assert_eq!(date_res.confidence, ConfidenceLevel::High);
+            }
+        }
+    }
+}

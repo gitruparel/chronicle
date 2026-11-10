@@ -37,6 +37,17 @@ impl ExifToolManager {
         Self::locate_exiftool_with_app(None)
     }
 
+    /// Checks whether an ExifTool executable actually runs and responds to -ver
+    fn is_working_binary(path: &Path) -> bool {
+        if !path.exists() {
+            return false;
+        }
+        match Command::new(path).arg("-ver").output() {
+            Ok(out) => out.status.success(),
+            Err(_) => false,
+        }
+    }
+
     /// Finds exiftool in known locations:
     /// 1. Official Tauri 2 runtime resource directory (for packaged production installer/NSIS)
     /// 2. Next to executable or sibling resources directory
@@ -44,61 +55,57 @@ impl ExifToolManager {
     /// 4. Known install path in user LocalAppData
     /// 5. System PATH
     pub fn locate_exiftool_with_app(app: Option<&AppHandle>) -> Option<PathBuf> {
+        let mut candidates = Vec::new();
+
         // 1. Official Tauri 2 resource resolver
         if let Some(app_handle) = app {
             if let Ok(resolved) = app_handle.path().resolve("resources/exiftool.exe", tauri::path::BaseDirectory::Resource) {
-                if resolved.exists() {
-                    return Some(resolved);
-                }
+                candidates.push(resolved);
             }
             if let Ok(res_dir) = app_handle.path().resource_dir() {
-                let candidate_sub = res_dir.join("resources").join("exiftool.exe");
-                if candidate_sub.exists() {
-                    return Some(candidate_sub);
-                }
-                let candidate_flat = res_dir.join("exiftool.exe");
-                if candidate_flat.exists() {
-                    return Some(candidate_flat);
-                }
+                candidates.push(res_dir.join("resources").join("exiftool.exe"));
+                candidates.push(res_dir.join("exiftool.exe"));
             }
         }
 
         // 2. Next to current executable (packaged binary sibling)
         if let Ok(current_exe) = std::env::current_exe() {
             if let Some(parent) = current_exe.parent() {
-                let candidate2 = parent.join("resources").join("exiftool.exe");
-                if candidate2.exists() {
-                    return Some(candidate2);
-                }
-                let candidate2_flat = parent.join("exiftool.exe");
-                if candidate2_flat.exists() {
-                    return Some(candidate2_flat);
-                }
+                candidates.push(parent.join("resources").join("exiftool.exe"));
+                candidates.push(parent.join("exiftool.exe"));
             }
         }
 
         // 3. Current working directory / workspace resources (dev mode)
-        let candidate1 = PathBuf::from("src-tauri/resources/exiftool.exe");
-        if candidate1.exists() {
-            return Some(candidate1);
-        }
-        let candidate1_alt = PathBuf::from("resources/exiftool.exe");
-        if candidate1_alt.exists() {
-            return Some(candidate1_alt);
-        }
+        candidates.push(PathBuf::from("src-tauri/resources/exiftool.exe"));
+        candidates.push(PathBuf::from("resources/exiftool.exe"));
 
         // 4. User LocalAppData Programs
         if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
-            let candidate3 = PathBuf::from(local_app_data).join("Programs").join("ExifTool").join("ExifTool.exe");
-            if candidate3.exists() {
-                return Some(candidate3);
+            candidates.push(PathBuf::from(local_app_data).join("Programs").join("ExifTool").join("ExifTool.exe"));
+        }
+
+        // First pass: find candidate that successfully executes -ver
+        for candidate in &candidates {
+            if Self::is_working_binary(candidate) {
+                log::info!("Discovered working ExifTool at: {}", candidate.display());
+                return Some(candidate.clone());
             }
         }
 
         // 5. System PATH lookup
         if let Ok(output) = Command::new("exiftool").arg("-ver").output() {
             if output.status.success() {
+                log::info!("Discovered system PATH exiftool");
                 return Some(PathBuf::from("exiftool"));
+            }
+        }
+
+        // Fallback: return first candidate that exists on disk even if execution verification failed
+        for candidate in candidates {
+            if candidate.exists() {
+                log::warn!("Using unverified ExifTool at: {}", candidate.display());
+                return Some(candidate);
             }
         }
 
@@ -110,7 +117,7 @@ impl ExifToolManager {
     /// Exiftool is invoked with:
     /// `-j` (JSON output)
     /// `-charset filename=utf8` (UTF-8 path handling)
-    /// `-fast2` (avoid reading trailing media data where not needed)
+    /// `-fast` (avoid parsing maker notes, but allow reading trailer moov atoms for MP4/MOV)
     /// `-G` (group names like EXIF, QuickTime, XMP, etc.)
     pub fn extract_batch(&self, paths: &[&Path]) -> Result<Vec<Value>, String> {
         if paths.is_empty() {
@@ -127,7 +134,7 @@ impl ExifToolManager {
            .arg("-charset")
            .arg("filename=utf8")
            .arg("-G") // Show tag group names: EXIF:DateTimeOriginal, QuickTime:CreateDate, etc.
-           .arg("-fast2");
+           .arg("-fast"); // Fast tag extraction without skipping video trailer atoms
 
         for p in paths {
             cmd.arg(p.as_os_str());

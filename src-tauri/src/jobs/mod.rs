@@ -14,6 +14,29 @@ use crate::organizer::plan_destinations;
 use crate::scanner::{check_overlap, scan_directory};
 use crate::types::{FileStatus, JobOptions, JobProgress, JobStatus, JobSummary};
 
+/// Normalizes path representations so that ExifTool's forward-slashed SourceFile paths
+/// match Rust PathBuf string representations across Windows and Unix platforms.
+pub fn normalize_path_key(path_str: &str) -> String {
+    let trimmed = path_str.trim();
+    // Strip Windows extended length prefixes
+    let stripped = if let Some(unc) = trimmed.strip_prefix(r"\\?\UNC\") {
+        format!("//{}", unc)
+    } else if let Some(regular) = trimmed.strip_prefix(r"\\?\") {
+        regular.to_string()
+    } else {
+        trimmed.to_string()
+    };
+    let with_forward_slashes = stripped.replace('\\', "/");
+    #[cfg(windows)]
+    {
+        with_forward_slashes.to_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        with_forward_slashes
+    }
+}
+
 pub struct JobManager {
     db: Database,
     cancellation_tokens: Arc<TokioMutex<HashMap<String, Arc<AtomicBool>>>>,
@@ -80,29 +103,40 @@ impl JobManager {
 
         for chunk in scan_result.files.chunks(batch_size) {
             let paths: Vec<&Path> = chunk.iter().map(|f| f.source_path.as_path()).collect();
-            let metadata_map = if exiftool.is_available() {
+            let (metadata_map, raw_arr) = if exiftool.is_available() {
                 match exiftool.extract_batch(&paths) {
                     Ok(arr) => {
                         let mut map = HashMap::new();
-                        for item in arr {
+                        for item in &arr {
                             if let Some(src) = item.get("SourceFile").and_then(|v| v.as_str()) {
-                                map.insert(src.to_string(), item);
+                                map.insert(normalize_path_key(src), item.clone());
                             }
                         }
-                        map
+                        (map, arr)
                     }
                     Err(e) => {
                         log::warn!("Batch metadata extraction warning: {}", e);
-                        HashMap::new()
+                        (HashMap::new(), Vec::new())
                     }
                 }
             } else {
-                HashMap::new()
+                (HashMap::new(), Vec::new())
             };
 
-            for file in chunk {
+            for (idx, file) in chunk.iter().enumerate() {
                 let path_str = file.source_path.to_string_lossy().to_string();
-                let meta = metadata_map.get(&path_str);
+                let key = normalize_path_key(&path_str);
+                // 1. Direct normalized lookup
+                // 2. Aligned positional fallback if batch counts match
+                let meta = metadata_map.get(&key)
+                    .or_else(|| {
+                        if raw_arr.len() == chunk.len() {
+                            raw_arr.get(idx)
+                        } else {
+                            None
+                        }
+                    });
+
                 let date_res = resolve_date(
                     &file.source_path,
                     file.extension.as_deref(),
