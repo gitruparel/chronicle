@@ -15,11 +15,12 @@ import type {
 
 export const api = {
   // Folder pickers via native dialog plugin
-  async pickFolder(title: string): Promise<string | null> {
+  async pickFolder(title: string, defaultPath?: string): Promise<string | null> {
     const selected = await open({
       directory: true,
       multiple: false,
       title,
+      defaultPath: defaultPath || undefined,
     });
     if (typeof selected === 'string') {
       return selected;

@@ -8,8 +8,12 @@ interface NewJobPageProps {
 }
 
 export function NewJobPage({ onScanComplete }: NewJobPageProps) {
-  const [sourcePath, setSourcePath] = useState('');
-  const [destPath, setDestPath] = useState('');
+  const [sourcePath, setSourcePath] = useState(() => {
+    return localStorage.getItem('chronicle_last_source_path') || '';
+  });
+  const [destPath, setDestPath] = useState(() => {
+    return localStorage.getItem('chronicle_last_dest_path') || '';
+  });
   const [isScanning, setIsScanning] = useState(false);
   const [scanError, setScanError] = useState<string | null>(null);
 
@@ -23,9 +27,11 @@ export function NewJobPage({ onScanComplete }: NewJobPageProps) {
 
   const handlePickSource = async () => {
     try {
-      const selected = await api.pickFolder('Select Source Directory to Organize');
+      const defaultDir = sourcePath.trim() || localStorage.getItem('chronicle_last_source_path') || undefined;
+      const selected = await api.pickFolder('Select Source Directory to Organize', defaultDir);
       if (selected) {
         setSourcePath(selected);
+        localStorage.setItem('chronicle_last_source_path', selected);
         setScanError(null);
       }
     } catch (e) {
@@ -35,9 +41,11 @@ export function NewJobPage({ onScanComplete }: NewJobPageProps) {
 
   const handlePickDestination = async () => {
     try {
-      const selected = await api.pickFolder('Select Destination Directory');
+      const defaultDir = destPath.trim() || localStorage.getItem('chronicle_last_dest_path') || undefined;
+      const selected = await api.pickFolder('Select Destination Directory', defaultDir);
       if (selected) {
         setDestPath(selected);
+        localStorage.setItem('chronicle_last_dest_path', selected);
         setScanError(null);
       }
     } catch (e) {
@@ -116,8 +124,12 @@ export function NewJobPage({ onScanComplete }: NewJobPageProps) {
           <div className="flex gap-2">
             <input
               type="text"
-              readOnly
               value={sourcePath}
+              onChange={(e) => {
+                setSourcePath(e.target.value);
+                localStorage.setItem('chronicle_last_source_path', e.target.value);
+                setScanError(null);
+              }}
               placeholder="Select folder containing files..."
               className="flex-1 bg-background border border-border rounded-lg px-3 py-2 text-xs font-mono text-text-primary placeholder:text-text-muted focus:outline-none focus:border-accent"
             />
@@ -145,8 +157,12 @@ export function NewJobPage({ onScanComplete }: NewJobPageProps) {
           <div className="flex gap-2">
             <input
               type="text"
-              readOnly
               value={destPath}
+              onChange={(e) => {
+                setDestPath(e.target.value);
+                localStorage.setItem('chronicle_last_dest_path', e.target.value);
+                setScanError(null);
+              }}
               placeholder="Select destination root folder..."
               className="flex-1 bg-background border border-border rounded-lg px-3 py-2 text-xs font-mono text-text-primary placeholder:text-text-muted focus:outline-none focus:border-accent"
             />
