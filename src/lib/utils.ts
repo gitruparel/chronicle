@@ -20,6 +20,7 @@ export function formatDateSourceLabel(source: DateSource): { label: string; colo
     case 'exif_original':
       return { label: 'EXIF Original', color: 'bg-blue-500/10 text-blue-400 border-blue-500/20' };
     case 'quicktime_creation':
+    case 'quick_time_creation':
       return { label: 'QuickTime', color: 'bg-purple-500/10 text-purple-400 border-purple-500/20' };
     case 'embedded_doc_audio':
       return { label: 'Embedded Media', color: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' };

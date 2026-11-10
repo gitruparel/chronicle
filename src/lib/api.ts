@@ -58,11 +58,19 @@ export const api = {
     });
   },
 
-  async getPreviewFiles(jobId: string, page: number, pageSize: number): Promise<PaginatedFilesResponse> {
+  async getPreviewFiles(
+    jobId: string,
+    page: number,
+    pageSize: number,
+    filter?: string,
+    search?: string
+  ): Promise<PaginatedFilesResponse> {
     return invoke<PaginatedFilesResponse>('get_preview_files', {
       jobId,
       page,
       pageSize,
+      filter: filter === 'all' ? null : filter || null,
+      search: search?.trim() ? search.trim() : null,
     });
   },
 

@@ -3,6 +3,19 @@ use std::process::Command;
 use serde_json::Value;
 use tauri::{AppHandle, Manager};
 
+/// Creates a Command configured on Windows to suppress console window popup (CREATE_NO_WINDOW = 0x08000000).
+/// This prevents CMD/PowerShell windows from flickering open and closing during batch metadata extraction.
+fn silent_command<P: AsRef<std::ffi::OsStr>>(program: P) -> Command {
+    let mut cmd = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
 pub struct ExifToolManager {
     executable_path: Option<PathBuf>,
 }
@@ -42,7 +55,7 @@ impl ExifToolManager {
         if !path.exists() {
             return false;
         }
-        match Command::new(path).arg("-ver").output() {
+        match silent_command(path).arg("-ver").output() {
             Ok(out) => out.status.success(),
             Err(_) => false,
         }
@@ -94,7 +107,7 @@ impl ExifToolManager {
         }
 
         // 5. System PATH lookup
-        if let Ok(output) = Command::new("exiftool").arg("-ver").output() {
+        if let Ok(output) = silent_command("exiftool").arg("-ver").output() {
             if output.status.success() {
                 log::info!("Discovered system PATH exiftool");
                 return Some(PathBuf::from("exiftool"));
@@ -129,7 +142,7 @@ impl ExifToolManager {
             None => return Err("ExifTool binary not found or unavailable".to_string()),
         };
 
-        let mut cmd = Command::new(exe);
+        let mut cmd = silent_command(exe);
         cmd.arg("-j")
            .arg("-charset")
            .arg("filename=utf8")

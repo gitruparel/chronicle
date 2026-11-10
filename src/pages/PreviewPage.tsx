@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useCallback } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import {
   Calendar,
   FileText,
@@ -38,10 +38,10 @@ export function PreviewPage({ jobId, summary, onBack, onConfirmCopy }: PreviewPa
   const [sourceFilter, setSourceFilter] = useState<string>('all');
   const [selectedFile, setSelectedFile] = useState<PlannedFile | null>(null);
 
-  const fetchFiles = useCallback(async (p: number) => {
+  const fetchFiles = useCallback(async (p: number, filter: string, search: string) => {
     setIsLoading(true);
     try {
-      const res = await api.getPreviewFiles(jobId, p, pageSize);
+      const res = await api.getPreviewFiles(jobId, p, pageSize, filter, search);
       setFiles(res.files);
       setTotalFiles(res.total);
     } catch (e) {
@@ -52,41 +52,18 @@ export function PreviewPage({ jobId, summary, onBack, onConfirmCopy }: PreviewPa
   }, [jobId, pageSize]);
 
   useEffect(() => {
-    fetchFiles(page);
-  }, [page, fetchFiles]);
+    fetchFiles(page, sourceFilter, searchTerm);
+  }, [page, sourceFilter, searchTerm, fetchFiles]);
 
-  // Client-side filtering on current page
-  const filteredFiles = useMemo(() => {
-    return files.filter((f) => {
-      const matchesSearch =
-        f.filename.toLowerCase().includes(searchTerm.toLowerCase()) ||
-        f.relative_path.toLowerCase().includes(searchTerm.toLowerCase());
+  const handleSearchChange = (term: string) => {
+    setSearchTerm(term);
+    setPage(0);
+  };
 
-      if (!matchesSearch) return false;
-
-      if (sourceFilter === 'embedded') {
-        return ['exif_original', 'quicktime_creation', 'embedded_doc_audio', 'embedded_other'].includes(
-          f.date_resolution.date_source
-        );
-      }
-      if (sourceFilter === 'modified') {
-        return f.date_resolution.date_source === 'filesystem_modified';
-      }
-      if (sourceFilter === 'no_date') {
-        return f.date_resolution.date_source === 'none';
-      }
-      if (sourceFilter === 'collisions') {
-        return f.is_collision;
-      }
-      if (sourceFilter === 'excluded') {
-        return f.status === 'excluded';
-      }
-      if (sourceFilter === 'errors') {
-        return f.status === 'failed' || f.destination_folder === 'Scan Errors';
-      }
-      return true;
-    });
-  }, [files, searchTerm, sourceFilter]);
+  const handleFilterChange = (filterId: string) => {
+    setSourceFilter(filterId);
+    setPage(0);
+  };
 
   const totalPages = Math.ceil(totalFiles / pageSize);
 
@@ -204,7 +181,7 @@ export function PreviewPage({ jobId, summary, onBack, onConfirmCopy }: PreviewPa
           <input
             type="text"
             value={searchTerm}
-            onChange={(e) => setSearchTerm(e.target.value)}
+            onChange={(e) => handleSearchChange(e.target.value)}
             placeholder="Search filename or path..."
             className="w-full bg-background border border-border rounded-lg pl-8 pr-3 py-1.5 text-xs text-text-primary placeholder:text-text-muted focus:outline-none focus:border-accent"
           />
@@ -225,7 +202,7 @@ export function PreviewPage({ jobId, summary, onBack, onConfirmCopy }: PreviewPa
           ].map((item) => (
             <button
               key={item.id}
-              onClick={() => setSourceFilter(item.id)}
+              onClick={() => handleFilterChange(item.id)}
               className={`px-2.5 py-1 rounded-md text-[11px] font-medium transition-colors shrink-0 ${
                 sourceFilter === item.id
                   ? 'bg-accent text-white'
@@ -259,14 +236,14 @@ export function PreviewPage({ jobId, summary, onBack, onConfirmCopy }: PreviewPa
                     Loading preview files...
                   </td>
                 </tr>
-              ) : filteredFiles.length === 0 ? (
+              ) : files.length === 0 ? (
                 <tr>
                   <td colSpan={6} className="py-12 text-center text-text-muted text-xs">
                     No files matching current criteria.
                   </td>
                 </tr>
               ) : (
-                filteredFiles.map((file) => {
+                files.map((file) => {
                   const tagMeta = formatDateSourceLabel(file.date_resolution.date_source);
                   return (
                     <tr
@@ -331,7 +308,7 @@ export function PreviewPage({ jobId, summary, onBack, onConfirmCopy }: PreviewPa
         {/* Pagination Bar */}
         <div className="flex items-center justify-between border-t border-border px-4 py-2.5 bg-surface text-xs text-text-muted">
           <div>
-            Showing {Math.min(filteredFiles.length, pageSize)} of {totalFiles.toLocaleString()} files
+            Showing {Math.min(files.length, pageSize)} of {totalFiles.toLocaleString()} files
           </div>
           <div className="flex items-center gap-2">
             <button

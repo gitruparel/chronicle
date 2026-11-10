@@ -23,6 +23,7 @@ export type FileStatus =
 export type DateSource =
   | 'exif_original'
   | 'quicktime_creation'
+  | 'quick_time_creation'
   | 'embedded_doc_audio'
   | 'embedded_other'
   | 'filesystem_modified'

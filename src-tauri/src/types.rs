@@ -33,6 +33,7 @@ pub enum FileStatus {
 #[serde(rename_all = "snake_case")]
 pub enum DateSource {
     ExifOriginal,
+    #[serde(rename = "quicktime_creation", alias = "quick_time_creation")]
     QuickTimeCreation,
     EmbeddedDocAudio,
     EmbeddedOther,

@@ -528,7 +528,7 @@ impl Database {
 
             let date_source = match date_source_str.as_deref() {
                 Some("exif_original") => DateSource::ExifOriginal,
-                Some("quicktime_creation") => DateSource::QuickTimeCreation,
+                Some("quicktime_creation") | Some("quick_time_creation") => DateSource::QuickTimeCreation,
                 Some("embedded_doc_audio") => DateSource::EmbeddedDocAudio,
                 Some("embedded_other") => DateSource::EmbeddedOther,
                 Some("filesystem_modified") => DateSource::FilesystemModified,
@@ -579,6 +579,141 @@ impl Database {
             result.push(r?);
         }
         Ok(result)
+    }
+
+    /// Retrieves filtered and paginated planned files with total matching count
+    pub fn get_preview_files_filtered(
+        &self,
+        job_id: &str,
+        limit: usize,
+        offset: usize,
+        filter: Option<&str>,
+        search: Option<&str>,
+    ) -> SqlResult<(Vec<PlannedFile>, usize)> {
+        let conn = self.conn.lock().unwrap();
+
+        let mut where_clause = "WHERE job_id = ?1".to_string();
+        let mut sql_params: Vec<rusqlite::types::Value> = vec![rusqlite::types::Value::Text(job_id.to_string())];
+
+        if let Some(s) = search {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() {
+                let p_idx = sql_params.len() + 1;
+                where_clause.push_str(&format!(" AND (filename LIKE ?{0} OR relative_path LIKE ?{0})", p_idx));
+                sql_params.push(rusqlite::types::Value::Text(format!("%{}%", trimmed)));
+            }
+        }
+
+        if let Some(f) = filter {
+            match f {
+                "embedded" => {
+                    where_clause.push_str(" AND date_source IN ('exif_original', 'quicktime_creation', 'quick_time_creation', 'embedded_doc_audio', 'embedded_other')");
+                }
+                "modified" => {
+                    where_clause.push_str(" AND date_source = 'filesystem_modified'");
+                }
+                "no_date" => {
+                    where_clause.push_str(" AND (date_source = 'none' OR resolved_date IS NULL OR destination_folder = 'No Date') AND status NOT IN ('failed', 'excluded')");
+                }
+                "collisions" => {
+                    where_clause.push_str(" AND is_collision = 1");
+                }
+                "excluded" => {
+                    where_clause.push_str(" AND status = 'excluded'");
+                }
+                "errors" => {
+                    where_clause.push_str(" AND (status = 'failed' OR destination_folder = 'Scan Errors')");
+                }
+                _ => {}
+            }
+        }
+
+        // 1. Get total count matching criteria
+        let count_query = format!("SELECT COUNT(*) FROM job_files {}", where_clause);
+        let mut count_stmt = conn.prepare(&count_query)?;
+        let total: i64 = count_stmt.query_row(rusqlite::params_from_iter(sql_params.iter()), |r| r.get(0))?;
+
+        // 2. Get paginated rows
+        let rows_query = format!(
+            "SELECT id, source_path, relative_path, filename, extension, file_size, source_mtime,
+                    status, resolved_date, date_source, raw_timestamp, confidence, reason,
+                    timezone_info, destination_folder, planned_filename, destination_path,
+                    is_collision, collision_suffix, sha256, error_message
+             FROM job_files {} ORDER BY rowid LIMIT {} OFFSET {}",
+            where_clause, limit, offset
+        );
+
+        let mut stmt = conn.prepare(&rows_query)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(sql_params.iter()), |row| {
+            let status_str: String = row.get(7)?;
+            let date_source_str: Option<String> = row.get(9)?;
+            let conf_str: Option<String> = row.get(11)?;
+
+            let status = match status_str.as_str() {
+                "verified" => FileStatus::Verified,
+                "failed" => FileStatus::Failed,
+                "copying" => FileStatus::Copying,
+                "analysed" => FileStatus::Analysed,
+                "skipped" => FileStatus::Skipped,
+                "excluded" => FileStatus::Excluded,
+                "discovered" => FileStatus::Discovered,
+                _ => FileStatus::Pending,
+            };
+
+            let date_source = match date_source_str.as_deref() {
+                Some("exif_original") => DateSource::ExifOriginal,
+                Some("quicktime_creation") | Some("quick_time_creation") => DateSource::QuickTimeCreation,
+                Some("embedded_doc_audio") => DateSource::EmbeddedDocAudio,
+                Some("embedded_other") => DateSource::EmbeddedOther,
+                Some("filesystem_modified") => DateSource::FilesystemModified,
+                _ => DateSource::None,
+            };
+
+            let confidence = match conf_str.as_deref() {
+                Some("high") => ConfidenceLevel::High,
+                Some("medium") => ConfidenceLevel::Medium,
+                Some("low") => ConfidenceLevel::Low,
+                _ => ConfidenceLevel::Fallback,
+            };
+
+            let date_resolution = DateResolution {
+                resolved_date: row.get(8)?,
+                date_source,
+                raw_timestamp: row.get(10)?,
+                confidence,
+                reason: row.get(12).unwrap_or_default(),
+                timezone_info: row.get(13)?,
+            };
+
+            let is_collision_int: i32 = row.get(17)?;
+            let dst_str: Option<String> = row.get(16)?;
+
+            Ok(PlannedFile {
+                id: row.get(0)?,
+                source_path: PathBuf::from(row.get::<_, String>(1)?),
+                relative_path: PathBuf::from(row.get::<_, String>(2)?),
+                filename: row.get(3)?,
+                extension: row.get(4)?,
+                size_bytes: row.get::<_, i64>(5)? as u64,
+                modified_ms: row.get(6)?,
+                date_resolution,
+                destination_folder: row.get(14)?,
+                planned_filename: row.get(15)?,
+                destination_path: dst_str.map(PathBuf::from).unwrap_or_default(),
+                is_collision: is_collision_int != 0,
+                collision_suffix: row.get(18)?,
+                status,
+                sha256: row.get(19)?,
+                error_message: row.get(20)?,
+            })
+        })?;
+
+        let mut files = Vec::new();
+        for r in rows {
+            files.push(r?);
+        }
+
+        Ok((files, total as usize))
     }
 
     /// Updates status of a file during/after copy
@@ -741,7 +876,7 @@ impl Database {
         ).unwrap_or(0) as u64;
 
         let embedded_date_count: u64 = conn.query_row(
-            "SELECT COUNT(*) FROM job_files WHERE job_id = ?1 AND date_source IN ('exif_original', 'quicktime_creation', 'embedded_doc_audio', 'embedded_other')",
+            "SELECT COUNT(*) FROM job_files WHERE job_id = ?1 AND date_source IN ('exif_original', 'quicktime_creation', 'quick_time_creation', 'embedded_doc_audio', 'embedded_other')",
             params![job_id],
             |r| r.get::<_, i64>(0),
         ).unwrap_or(0) as u64;
@@ -753,7 +888,7 @@ impl Database {
         ).unwrap_or(0) as u64;
 
         let no_date_count: u64 = conn.query_row(
-            "SELECT COUNT(*) FROM job_files WHERE job_id = ?1 AND date_source = 'none' AND status NOT IN ('failed', 'excluded')",
+            "SELECT COUNT(*) FROM job_files WHERE job_id = ?1 AND (date_source = 'none' OR resolved_date IS NULL OR destination_folder = 'No Date') AND status NOT IN ('failed', 'excluded')",
             params![job_id],
             |r| r.get::<_, i64>(0),
         ).unwrap_or(0) as u64;

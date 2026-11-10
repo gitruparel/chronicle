@@ -98,17 +98,21 @@ pub fn get_preview_files(
     job_id: String,
     page: usize,
     page_size: usize,
+    filter: Option<String>,
+    search: Option<String>,
 ) -> Result<PaginatedFilesResponse, String> {
     let offset = page * page_size;
-    let files = state.job_manager.get_db().get_planned_files(&job_id, Some(page_size), offset)
-        .map_err(|e| e.to_string())?;
-
-    let summary = state.job_manager.get_db().get_job_summary(&job_id)
-        .map_err(|e| e.to_string())?;
+    let (files, total) = state.job_manager.get_db().get_preview_files_filtered(
+        &job_id,
+        page_size,
+        offset,
+        filter.as_deref(),
+        search.as_deref(),
+    ).map_err(|e| e.to_string())?;
 
     Ok(PaginatedFilesResponse {
         files,
-        total: summary.total_files as usize,
+        total,
         page,
         page_size,
     })
