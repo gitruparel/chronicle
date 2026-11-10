@@ -119,6 +119,15 @@ pub fn get_preview_files(
 }
 
 #[tauri::command]
+pub fn get_job_cmd(
+    state: State<'_, AppState>,
+    job_id: String,
+) -> Result<Option<JobRecord>, String> {
+    state.job_manager.get_db().get_job(&job_id)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub fn get_job_summary_cmd(
     state: State<'_, AppState>,
     job_id: String,

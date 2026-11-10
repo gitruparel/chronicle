@@ -74,6 +74,10 @@ export const api = {
     });
   },
 
+  async getJob(jobId: string): Promise<JobRecord | null> {
+    return invoke<JobRecord | null>('get_job_cmd', { jobId });
+  },
+
   async getJobSummary(jobId: string): Promise<JobSummary> {
     return invoke<JobSummary>('get_job_summary_cmd', { jobId });
   },

@@ -606,6 +606,12 @@ impl Database {
 
         if let Some(f) = filter {
             match f {
+                "verified" | "copied" => {
+                    where_clause.push_str(" AND status = 'verified'");
+                }
+                "pending" => {
+                    where_clause.push_str(" AND status = 'pending'");
+                }
                 "embedded" => {
                     where_clause.push_str(" AND date_source IN ('exif_original', 'quicktime_creation', 'quick_time_creation', 'embedded_doc_audio', 'embedded_other')");
                 }
@@ -805,6 +811,58 @@ impl Database {
         )?;
 
         Ok(count)
+    }
+
+    /// Retrieves a single job record by ID
+    pub fn get_job(&self, job_id: &str) -> SqlResult<Option<JobRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, name, source_path, destination_path, status,
+                   total_files, total_bytes, copied_files, copied_bytes, failed_files,
+                   COALESCE(excluded_files, 0), created_at, completed_at
+            FROM jobs
+            WHERE id = ?1
+            "#,
+        )?;
+
+        let mut rows = stmt.query_map(params![job_id], |row| {
+            let status_str: String = row.get(4)?;
+            let status = match status_str.as_str() {
+                "created" => JobStatus::Created,
+                "scanning" => JobStatus::Scanning,
+                "scanned" => JobStatus::Scanned,
+                "analysing" => JobStatus::Analysing,
+                "analysed" => JobStatus::Analysed,
+                "running" => JobStatus::Running,
+                "paused" => JobStatus::Paused,
+                "completed" => JobStatus::Completed,
+                "cancelled" => JobStatus::Cancelled,
+                _ => JobStatus::Failed,
+            };
+
+            Ok(JobRecord {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                source_path: row.get(2)?,
+                destination_path: row.get(3)?,
+                status,
+                total_files: row.get::<_, i64>(5)? as u64,
+                total_bytes: row.get::<_, i64>(6)? as u64,
+                copied_files: row.get::<_, i64>(7)? as u64,
+                copied_bytes: row.get::<_, i64>(8)? as u64,
+                failed_files: row.get::<_, i64>(9)? as u64,
+                excluded_files: row.get::<_, i64>(10)? as u64,
+                created_at: row.get(11)?,
+                completed_at: row.get(12)?,
+            })
+        })?;
+
+        if let Some(r) = rows.next() {
+            Ok(Some(r?))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Returns persistent history of all past jobs

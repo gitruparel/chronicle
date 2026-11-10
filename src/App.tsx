@@ -251,7 +251,14 @@ export function App() {
         )}
 
         {activeTab === 'history' && (
-          <HistoryPage />
+          <HistoryPage
+            onOpenJobInPreview={(jobId, summary, destination) => {
+              setCurrentJobId(jobId);
+              setCurrentSummary(summary);
+              setCurrentDestination(destination);
+              setActiveTab('preview');
+            }}
+          />
         )}
 
         {activeTab === 'settings' && (

@@ -77,6 +77,7 @@ pub fn run() {
             commands::check_folder_overlap_cmd,
             commands::create_and_scan_job,
             commands::get_preview_files,
+            commands::get_job_cmd,
             commands::get_job_summary_cmd,
             commands::get_all_jobs_cmd,
             commands::start_copy_job,
